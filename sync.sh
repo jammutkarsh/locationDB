@@ -27,6 +27,7 @@ YESTERDAY=$(date -u -v-1d +%F)
 
 if [[ "$LAST_SYNC" == "$YESTERDAY" ]]; then
   echo "✅ Already synced up to yesterday ($LAST_SYNC)"
+  rm -rf data
   exit 0
 fi
 
@@ -49,7 +50,7 @@ psql "$DB_URL" -f sql/05_apply_sync.sql
 
 echo "🔍 Validating admin code mappings..."
 UNMAPPED_COUNT=$(psql "$DB_URL" -t -A -f sql/03_validate.sql || echo 999999)
-if [ "$UNMAPPED_COUNT" -gt $STATE_LESS_CITIES_COUNT ]; then
+if [ "$UNMAPPED_COUNT" -gt "$STATE_LESS_CITIES_COUNT" ]; then
   echo "❌ Validation failed: $UNMAPPED_COUNT unmapped cities"
   exit 1
 fi

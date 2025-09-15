@@ -45,7 +45,7 @@ psql "$DB_URL" -f sql/02_load.sql
 echo "🔍 Validating admin code mappings..."
 UNMAPPED_COUNT=$(psql "$DB_URL" -t -A -f sql/03_validate.sql)
 
-if [ "$UNMAPPED_COUNT" -gt $STATE_LESS_CITIES_COUNT ]; then
+if [ "$UNMAPPED_COUNT" -gt "$STATE_LESS_CITIES_COUNT" ]; then
     echo "❌ Validation failed: $UNMAPPED_COUNT unmapped cities"
     exit 1
 else
