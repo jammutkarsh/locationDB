@@ -1,6 +1,6 @@
 BEGIN;
 
--- Staging for daily modifications (same columns as cities15000)
+-- Staging for daily modifications (same columns as cities1000)
 CREATE TEMP TABLE mods (
 	geonameid BIGINT,
 	name TEXT,
@@ -35,7 +35,7 @@ CREATE TEMP TABLE dels (
 \copy dels FROM 'data/deletes.txt' WITH (FORMAT csv, DELIMITER E'\t', NULL '');
 
 -- Upsert modifications/new rows
-INSERT INTO cities15000 AS c (
+INSERT INTO cities1000 AS c (
 	geonameid, name, asciiname, alternatenames, latitude, longitude,
 	feature_class, feature_code, country_code, cc2,
 	admin1_code, admin2_code, admin3_code, admin4_code,
@@ -68,7 +68,7 @@ ON CONFLICT (geonameid) DO UPDATE SET
 	modification = EXCLUDED.modification;
 
 -- Apply deletions
-DELETE FROM cities15000
+DELETE FROM cities1000
 WHERE geonameid IN (SELECT geonameid FROM dels);
 
 COMMIT;
