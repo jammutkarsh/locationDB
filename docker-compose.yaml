@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:latest
+    container_name: postgres
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: REDACTED
+      POSTGRES_DB: locationdb
+    ports:
+      - "5432:5432"
+    networks:
+      - postgres_network
+
+networks:
+  postgres_network:
+    driver: bridge
