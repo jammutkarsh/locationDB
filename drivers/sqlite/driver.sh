@@ -47,7 +47,7 @@ db_load() {
 # Flatten staging tables into the final geonames_cities table
 db_flatten() {
   log_step "Flattening into final table..."
-  sqlite3 "$SQLITE_PATH" < "$DRIVER_DIR/sql/04_flatten.sql"
+  sqlite3 "$SQLITE_PATH" < "$DRIVER_DIR/sql/03_flatten.sql"
 }
 
 # SQLite does not support incremental sync

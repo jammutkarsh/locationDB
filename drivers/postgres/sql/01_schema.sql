@@ -78,3 +78,27 @@ CREATE TABLE IF NOT EXISTS geonames_cities (
     region               TEXT,
     geonameid            BIGINT UNIQUE
 );
+
+-- -------------------------------------------------------------------------
+-- Query 1: City name search
+--   Exact / prefix:  WHERE LOWER(city) = LOWER($1)
+--   Fuzzy / ILIKE:   WHERE city ILIKE '%london%'  (uses pg_trgm)
+-- -------------------------------------------------------------------------
+-- Enable trigram extension for fuzzy / ILIKE search
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- Case-insensitive exact / prefix lookup
+CREATE INDEX IF NOT EXISTS idx_geonames_cities_city_lower
+    ON geonames_cities (LOWER(city));
+
+-- Trigram index — powers ILIKE '%term%' and similarity() queries
+CREATE INDEX IF NOT EXISTS idx_geonames_cities_city_trgm
+    ON geonames_cities USING gin (city gin_trgm_ops);
+
+-- -------------------------------------------------------------------------
+-- Query 2: Proximity / reverse-geocoding by lat & long
+--   Bounding box:  WHERE latitude  BETWEEN $lat - $d AND $lat + $d
+--                  AND   longitude BETWEEN $lon - $d AND $lon + $d
+-- -------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_geonames_cities_lat_lon
+    ON geonames_cities (latitude, longitude);

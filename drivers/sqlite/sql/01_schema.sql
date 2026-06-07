@@ -85,3 +85,20 @@ CREATE TABLE geonames_cities (
     region               TEXT,
     geonameid            INTEGER UNIQUE
 );
+
+-- -------------------------------------------------------------------------
+-- Query 1: City name search
+--   Exact / case-insensitive:  WHERE city = $1 COLLATE NOCASE
+--   Note: SQLite has no trigram extension. For full fuzzy search, consider
+--         creating an FTS5 virtual table on top of geonames_cities.
+-- -------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_geonames_cities_city
+    ON geonames_cities (city COLLATE NOCASE);
+
+-- -------------------------------------------------------------------------
+-- Query 2: Proximity / reverse-geocoding by lat & long
+--   Bounding box:  WHERE latitude  BETWEEN $lat - $d AND $lat + $d
+--                  AND   longitude BETWEEN $lon - $d AND $lon + $d
+-- -------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_geonames_cities_lat_lon
+    ON geonames_cities (latitude, longitude);

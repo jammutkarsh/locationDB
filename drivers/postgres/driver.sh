@@ -43,7 +43,7 @@ db_load() {
 # Flatten staging tables into the final geonames_cities table
 db_flatten() {
   log_step "Flattening into final table..."
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$DRIVER_DIR/sql/04_flatten.sql"
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$DRIVER_DIR/sql/03_flatten.sql"
 }
 
 # Postgres supports incremental daily sync
