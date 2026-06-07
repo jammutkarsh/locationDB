@@ -102,3 +102,27 @@ CREATE INDEX IF NOT EXISTS idx_geonames_cities_city_trgm
 -- -------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_geonames_cities_lat_lon
     ON geonames_cities (latitude, longitude);
+
+-- -------------------------------------------------------------------------
+-- Query 3: Filter by country
+--   WHERE country_code = 'IN'
+--   Note: country and country_code both store the ISO-3166 code.
+--         Indexing country_code covers both columns.
+-- -------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_geonames_cities_country_code
+    ON geonames_cities (country_code);
+
+-- -------------------------------------------------------------------------
+-- Query 4: Filter by state / region
+--   WHERE region = 'Maharashtra'
+-- -------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_geonames_cities_region
+    ON geonames_cities (region);
+
+-- -------------------------------------------------------------------------
+-- Query 5: Cities within a specific state of a specific country
+--   WHERE country_code = 'IN' AND region = 'Maharashtra'
+--   The composite covers single-country filters too (leading column rule).
+-- -------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_geonames_cities_country_region
+    ON geonames_cities (country_code, region);
