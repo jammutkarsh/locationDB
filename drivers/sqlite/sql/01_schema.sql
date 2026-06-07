@@ -5,6 +5,10 @@
 --   • datetime('now') instead of now()
 --   • No CASCADE on DROP (SQLite ignores it anyway)
 
+DROP TRIGGER IF EXISTS geonames_cities_ai;
+DROP TRIGGER IF EXISTS geonames_cities_ad;
+DROP TRIGGER IF EXISTS geonames_cities_au;
+DROP TABLE IF EXISTS geonames_cities_fts;
 DROP TABLE IF EXISTS cities1000;
 DROP TABLE IF EXISTS admin1Codes;
 DROP TABLE IF EXISTS admin2Codes;
@@ -87,13 +91,53 @@ CREATE TABLE geonames_cities (
 );
 
 -- -------------------------------------------------------------------------
--- Query 1: City name search
---   Exact / case-insensitive:  WHERE city = $1 COLLATE NOCASE
---   Note: SQLite has no trigram extension. For full fuzzy search, consider
---         creating an FTS5 virtual table on top of geonames_cities.
+-- Query 1a: Exact / case-insensitive city name lookup
+--   WHERE city = $1 COLLATE NOCASE
 -- -------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_geonames_cities_city
     ON geonames_cities (city COLLATE NOCASE);
+
+-- -------------------------------------------------------------------------
+-- Query 1b: Full-text / fuzzy city search via FTS5
+--
+-- FTS5 external-content table — no data duplication.
+-- The index stores search tokens only; text is read from geonames_cities.
+--
+-- Example queries:
+--   Prefix:     SELECT gc.* FROM geonames_cities gc
+--               JOIN geonames_cities_fts fts ON fts.rowid = gc.id
+--               WHERE geonames_cities_fts MATCH 'lond*'
+--               ORDER BY rank;
+--
+--   Exact word: WHERE geonames_cities_fts MATCH 'london'
+--   Phrase:     WHERE geonames_cities_fts MATCH '"new york"'
+--   Any column: WHERE geonames_cities_fts MATCH 'mumbai OR bombay'
+-- -------------------------------------------------------------------------
+CREATE VIRTUAL TABLE geonames_cities_fts USING fts5(
+    city,
+    alternate_city_names,
+    content='geonames_cities',
+    content_rowid='id'
+);
+
+-- Triggers keep the FTS5 index in sync with geonames_cities for
+-- incremental updates (inserts, deletes, edits after the initial load).
+CREATE TRIGGER geonames_cities_ai AFTER INSERT ON geonames_cities BEGIN
+    INSERT INTO geonames_cities_fts(rowid, city, alternate_city_names)
+    VALUES (new.id, new.city, new.alternate_city_names);
+END;
+
+CREATE TRIGGER geonames_cities_ad AFTER DELETE ON geonames_cities BEGIN
+    INSERT INTO geonames_cities_fts(geonames_cities_fts, rowid, city, alternate_city_names)
+    VALUES ('delete', old.id, old.city, old.alternate_city_names);
+END;
+
+CREATE TRIGGER geonames_cities_au AFTER UPDATE ON geonames_cities BEGIN
+    INSERT INTO geonames_cities_fts(geonames_cities_fts, rowid, city, alternate_city_names)
+    VALUES ('delete', old.id, old.city, old.alternate_city_names);
+    INSERT INTO geonames_cities_fts(rowid, city, alternate_city_names)
+    VALUES (new.id, new.city, new.alternate_city_names);
+END;
 
 -- -------------------------------------------------------------------------
 -- Query 2: Proximity / reverse-geocoding by lat & long
