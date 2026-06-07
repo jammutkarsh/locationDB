@@ -1,110 +1,123 @@
 #!/usr/bin/env bash
+# sync.sh — Apply daily GeoNames delta files (modifications + deletions).
+#
+# Sync support depends on the driver. SQLite users should re-run populate.sh.
+#
+# Usage
+# -----
+#   ./sync.sh --driver postgres --db-url "postgres://user:pass@host/db"
+#   ./sync.sh --driver postgres --test    # start docker-compose automatically
+#   ./sync.sh --help
+#
+# Environment variables
+# ---------------------
+#   DB_DRIVER      — backend name
+#   DATABASE_URL   — postgres connection URL
+#   SQLITE_DB_PATH — sqlite file path
+#
+# Adding a new backend
+# --------------------
+#   See drivers/ADDING_A_DRIVER.md — implement db_supports_sync and db_sync.
+#   You never need to edit this file.
+
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# Load shared utilities
+# ---------------------------------------------------------------------------
+# shellcheck source=lib/core.sh
+source "$SCRIPT_DIR/lib/core.sh"
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+DRIVER="${DB_DRIVER:-}"
+DATABASE_URL="${DATABASE_URL:-}"
+SQLITE_PATH="${SQLITE_DB_PATH:-./locationdb.db}"
 TEST_MODE=0
-for arg in "$@"; do
-  if [ "$arg" = "--test" ]; then TEST_MODE=1; fi
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+usage() {
+  grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --driver)  DRIVER="$2";       shift 2 ;;
+    --db-url)  DATABASE_URL="$2"; shift 2 ;;
+    --db-path) SQLITE_PATH="$2";  shift 2 ;;
+    --test)    TEST_MODE=1;       shift   ;;
+    -h|--help) usage ;;
+    *) log_error "Unknown flag: $1"; usage ;;
+  esac
 done
 
-if [ "$TEST_MODE" -eq 1 ]; then
-  echo "🧪 Test mode: starting docker-compose..."
-  docker-compose up -d
+# ---------------------------------------------------------------------------
+# Validate and resolve driver
+# ---------------------------------------------------------------------------
+if [[ -z "$DRIVER" ]]; then
+  log_error "No driver specified."
+  log_error "Use --driver <name> or export DB_DRIVER=<name>"
+  log_error "Available drivers: $(ls "$SCRIPT_DIR/drivers" | grep -v '\.md' | tr '\n' ' ')"
+  exit 1
+fi
+
+DRIVER_DIR="$SCRIPT_DIR/drivers/$DRIVER"
+
+if [[ ! -f "$DRIVER_DIR/driver.sh" ]]; then
+  log_error "Driver '$DRIVER' not found (expected: $DRIVER_DIR/driver.sh)"
+  exit 1
+fi
+
+export DRIVER_DIR DATABASE_URL SQLITE_PATH
+
+# shellcheck disable=SC1090
+source "$DRIVER_DIR/driver.sh"
+
+# ---------------------------------------------------------------------------
+# Test-mode bootstrap
+# ---------------------------------------------------------------------------
+if [[ "$TEST_MODE" -eq 1 ]]; then
+  log_info "Test mode: starting docker-compose..."
+  POSTGRES_USER="${POSTGRES_USER:-locationdb_user}" \
+  POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-changeme}" \
+  POSTGRES_DB="${POSTGRES_DB:-locationdb}" \
+  docker-compose -f "$SCRIPT_DIR/docker-compose.yaml" up -d
   sleep 5
+  if [[ -z "$DATABASE_URL" ]]; then
+    PG_USER="${POSTGRES_USER:-locationdb_user}"
+    PG_PASS="${POSTGRES_PASSWORD:-changeme}"
+    PG_DB="${POSTGRES_DB:-locationdb}"
+    PG_PORT="${POSTGRES_PORT:-5432}"
+    DATABASE_URL="postgres://${PG_USER}:${PG_PASS}@localhost:${PG_PORT}/${PG_DB}?sslmode=disable"
+    export DATABASE_URL
+  fi
 fi
 
-DB_URL="postgres://user:pass@localhost:5432/locationdb?sslmode=disable"
+# ---------------------------------------------------------------------------
+# Check sync support
+# ---------------------------------------------------------------------------
+log_info "Driver : $(db_name)"
 
-mkdir -p data
-: > data/mods.txt
-: > data/deletes.txt
-
-LAST_SYNC=$(psql "$DB_URL" -t -A -c "SELECT COALESCE((SELECT last_synced FROM sync_state WHERE name='cities1000'),'2025-09-15');")
-
-YESTERDAY=$(date --date="yesterday" +%F)
-# YESTERDAY=$(date -u -v-1d +%F)
-
-if [[ "$LAST_SYNC" == "$YESTERDAY" ]]; then
-  echo "✅ Already synced up to yesterday ($LAST_SYNC)"
-  rm -rf data
-  exit 0
+if ! db_supports_sync; then
+  log_warn "$(db_name) does not support incremental sync."
+  log_warn "Re-run populate.sh to refresh the database from scratch."
+  exit 1
 fi
 
-echo "⬇️  Fetching GeoNames deltas for $YESTERDAY..."
-MOD_URL="http://download.geonames.org/export/dump/modifications-$YESTERDAY.txt"
-DEL_URL="http://download.geonames.org/export/dump/deletes-$YESTERDAY.txt"
+db_check_deps
 
-curl -fsSL "$MOD_URL" -o data/mods.txt || true
-curl -fsSL "$DEL_URL" -o data/deletes.txt || true
+# ---------------------------------------------------------------------------
+# Run sync for yesterday's delta
+# ---------------------------------------------------------------------------
+DATE=$(yesterday)
+log_info "Syncing delta for: $DATE"
 
-if [[ ! -s data/mods.txt && ! -s data/deletes.txt ]]; then
-  echo "ℹ️  No deltas to apply for $YESTERDAY."
-  psql "$DB_URL" -c "INSERT INTO sync_state(name,last_synced) VALUES ('cities1000', DATE '$YESTERDAY')
-                     ON CONFLICT (name) DO UPDATE SET last_synced = EXCLUDED.last_synced;"
-  exit 0
-fi
+db_sync "$DATE"
 
-echo "🛠 Applying deltas..."
-
-# Apply deletions to geonames_cities
-if [[ -s data/deletes.txt ]]; then
-  echo "  ⛔ Deleting rows from geonames_cities..."
-  awk '{print $1}' data/deletes.txt | psql "$DB_URL" -v ON_ERROR_STOP=1 -qAtc "COPY (SELECT 1) FROM STDIN;" >/dev/null 2>&1
-  psql "$DB_URL" -c "DELETE FROM geonames_cities WHERE geonameid IN (SELECT geonameid FROM (SELECT unnest(ARRAY[$(awk '{printf "%s,", $1}' data/deletes.txt | sed 's/,$//')])::bigint AS geonameid) AS t);"
-fi
-
-# Apply modifications to geonames_cities
-if [[ -s data/mods.txt ]]; then
-  echo "  ✏️  Upserting rows into geonames_cities..."
-  # Prepare a temp table for modifications
-  psql "$DB_URL" -c "
-    CREATE TABLE IF NOT EXISTS tmp_mods(
-      geonameid bigint,
-      name text,
-      asciiname text,
-      alternatenames text,
-      latitude double precision,
-      longitude double precision,
-      feature_class text,
-      feature_code text,
-      country_code text,
-      cc2 text,
-      admin1_code text,
-      admin2_code text,
-      admin3_code text,
-      admin4_code text,
-      population bigint,
-      elevation int,
-      dem int,
-      timezone text,
-      modification_date date
-    );"
-    psql "$DB_URL" -c "\copy tmp_mods (geonameid, name, asciiname, alternatenames, latitude, longitude, feature_class, feature_code, country_code, cc2, admin1_code, admin2_code, admin3_code, admin4_code, population, elevation, dem, timezone, modification_date) FROM 'data/mods.txt' WITH (FORMAT text, DELIMITER E'\t', NULL '');"
-
-    psql "$DB_URL" -c "INSERT INTO geonames_cities (
-      geonameid, city, country, timezone, population, latitude, longitude, country_code, alternate_city_names, region
-    )
-    SELECT DISTINCT ON (geonameid)
-      geonameid, name AS city, country_code AS country, timezone, population, latitude, longitude, country_code, 
-      COALESCE(string_to_array(NULLIF(alternatenames, ''), ','), ARRAY[]::text[]) AS alternate_city_names, admin1_code AS region
-    FROM tmp_mods v
-    ORDER BY geonameid, modification_date DESC
-    ON CONFLICT (geonameid) DO UPDATE SET
-      city = EXCLUDED.city,
-      country = EXCLUDED.country,
-      timezone = COALESCE(EXCLUDED.timezone, 'UTC'),
-      population = EXCLUDED.population,
-      latitude = EXCLUDED.latitude,
-      longitude = EXCLUDED.longitude,
-      country_code = EXCLUDED.country_code,
-      alternate_city_names = COALESCE(EXCLUDED.alternate_city_names, ARRAY[]::text[]),
-      region = EXCLUDED.region;"
-      
-      psql "$DB_URL" -c "DROP TABLE tmp_mods;"
-fi
-
-psql "$DB_URL" -c "INSERT INTO sync_state(name,last_synced) VALUES ('cities1000', DATE '$YESTERDAY')
-                   ON CONFLICT (name) DO UPDATE SET last_synced = EXCLUDED.last_synced;"
-
-echo "🎉 Sync completed (last_synced=$YESTERDAY)"
-
-rm -rf data
+cleanup
