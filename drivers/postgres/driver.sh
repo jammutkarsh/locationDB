@@ -90,8 +90,8 @@ db_sync() {
   # Upsert modifications
   if [[ -s data/mods.txt ]]; then
     log_info "Upserting modified rows into geonames_cities..."
-    psql "$DATABASE_URL" -c "
-      CREATE TEMP TABLE IF NOT EXISTS tmp_mods (
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<EOF
+      CREATE TEMP TABLE tmp_mods (
         geonameid       bigint,
         name            text,
         asciiname       text,
@@ -111,10 +111,10 @@ db_sync() {
         dem             int,
         timezone        text,
         modification_date date
-      );"
-    psql "$DATABASE_URL" -c \
-      "\copy tmp_mods FROM 'data/mods.txt' WITH (FORMAT text, DELIMITER E'\t', NULL '');"
-    psql "$DATABASE_URL" -c "
+      );
+
+      \copy tmp_mods FROM 'data/mods.txt' WITH (FORMAT text, DELIMITER E'\t', NULL '');
+
       INSERT INTO geonames_cities (
         geonameid, city, country, timezone, population,
         latitude, longitude, country_code, alternate_city_names, region
@@ -136,8 +136,8 @@ db_sync() {
         country_code         = EXCLUDED.country_code,
         alternate_city_names = COALESCE(EXCLUDED.alternate_city_names, ARRAY[]::text[]),
         region               = EXCLUDED.region,
-        updated_at           = now();"
-    psql "$DATABASE_URL" -c "DROP TABLE IF EXISTS tmp_mods;"
+        updated_at           = now();
+EOF
   fi
 
   _pg_record_sync "$date"

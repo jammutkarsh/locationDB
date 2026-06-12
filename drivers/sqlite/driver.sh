@@ -31,6 +31,7 @@ db_check_deps() {
 # Create schema (all tables + indexes)
 db_init() {
   log_step "Creating schema..."
+  mkdir -p "$(dirname "$SQLITE_PATH")"
   sqlite3 "$SQLITE_PATH" < "$DRIVER_DIR/sql/01_schema.sql"
 }
 
