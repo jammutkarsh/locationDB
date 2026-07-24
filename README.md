@@ -21,7 +21,7 @@ place names.
   - [`cities1000.zip`](https://download.geonames.org/export/dump/cities1000.zip) — all cities with population ≥ 1000
   - [`admin1CodesASCII.txt`](https://download.geonames.org/export/dump/admin1CodesASCII.txt) — first-level admin divisions (states / provinces)
   - [`admin2Codes.txt`](https://download.geonames.org/export/dump/admin2Codes.txt) — second-level admin divisions (counties / districts)
-  - [`adminCode5.zip`](https://download.geonames.org/export/dump/adminCode5.zip) — fifth-level admin codes
+  - [`countryInfo.txt`](https://download.geonames.org/export/dump/countryInfo.txt) — countries (ISO codes, capital, continent, currency, languages, …)
 
 > **Attribution requirement:** If you use this data in a public product, your
 > app or docs must visibly credit GeoNames per the CC BY 4.0 licence, e.g.:
@@ -62,9 +62,24 @@ cp .env.example .env
 
 The `.db` file is created automatically if it doesn't exist.
 
-#### PostgreSQL — remote server
+Pass `--cache` to skip re-downloading GeoNames files when `data/` already has
+them, and to keep `data/` after the import (by default it is deleted):
 
 ```bash
+./populate.sh --driver sqlite --db-path ./locationdb.db --cache
+```
+
+#### PostgreSQL — remote server
+
+Two ways to point it at a database; `DATABASE_URL` wins if both are set.
+
+```bash
+# 1 — standard libpq variables (also honours ~/.pgpass, PGSERVICE, PGSSLMODE)
+export PGHOST=db.example.com PGPORT=5432 \
+       PGUSER=locationdb_user PGPASSWORD=secret PGDATABASE=locationdb
+./populate.sh --driver postgres
+
+# 2 — a connection string
 ./populate.sh --driver postgres \
   --db-url "postgres://user:pass@host:5432/dbname?sslmode=disable"
 ```
@@ -99,11 +114,22 @@ feeds. **PostgreSQL only** — SQLite users re-run `populate.sh`.
 # Local test server
 ./sync.sh --driver postgres --test
 
-# Via env vars
+# Via env vars — connection string
 export DB_DRIVER=postgres
 export DATABASE_URL="postgres://user:pass@host:5432/dbname?sslmode=disable"
 ./sync.sh
+
+# Via env vars — libpq style
+export DB_DRIVER=postgres
+export PGHOST=db.example.com PGUSER=locationdb_user PGDATABASE=locationdb
+./sync.sh
 ```
+
+Only `geonames_cities` is delta-synced. States and countries change a handful
+of times a year — re-run `populate.sh` to refresh them.
+
+`--cache` works the same as in `populate.sh` — keeps downloaded delta files
+in `data/` instead of deleting them.
 
 Schedule this as a daily cron job:
 
@@ -113,23 +139,101 @@ Schedule this as a daily cron job:
 
 ---
 
-## Output table
+## Output tables
 
-Both backends produce a `geonames_cities` table with the same columns:
+Both backends produce the same three tables plus one flat view:
+
+| Object | Rows | What it is |
+|---|---|---|
+| `geonames_cities` | ~150k | Cities with population ≥ 1000 |
+| `geonames_states` | ~4k | First-level admin divisions (states / provinces) |
+| `geonames_countries` | 252 | Countries — ISO codes, capital, continent, currency, languages |
+| `locations` *(view)* | ~150k | The columns most callers want — slim projection of `geonames_cities` |
+
+Plus `sync_state` (one row, tracks the last applied delta) and, on SQLite,
+the `geonames_cities_fts` index. The raw GeoNames staging tables exist only
+while `populate.sh` runs; they are dropped at the end of the import (SQLite
+also `VACUUM`s), so the finished database contains nothing else.
+
+`geonames_cities` already carries the resolved **state** and **country
+names** — no join needed for the common case:
+
+```sql
+SELECT city, region, state, country, population FROM geonames_cities
+WHERE city = 'Mumbai' COLLATE NOCASE;      -- SQLite
+-- WHERE LOWER(city) = LOWER('Mumbai');    -- PostgreSQL
+
+-- city    | region          | state       | country | population
+-- Mumbai  | Mumbai Suburban | Maharashtra | India   | 12691836
+```
+
+How the GeoNames pieces correlate, and how the import resolves them:
+
+```
+cities1000.country_code                          -> countryInfo.ISO   -> country  ('India')
+cities1000.country_code || '.' || admin1_code    -> admin1Codes.code  -> state    ('Maharashtra')
+   … || '.' || admin2_code                       -> admin2Codes.code  -> region   ('Mumbai Suburban')
+```
+
+That concatenated admin1 key is stored as `state_code` (`IN.16`), which is
+also the primary key of `geonames_states` — so the reference tables stay
+joinable while the city row is readable on its own.
+
+### `locations` (view)
+
+Straight off `geonames_cities` (no joins, so it uses that table's indexes):
+
+| Column | Notes |
+|---|---|
+| `id` | Primary key of `geonames_cities` (also the FTS5 rowid) |
+| `city` | City name |
+| `region` | District / county (admin2). Equals `state` when GeoNames has no admin2 |
+| `state` | State / province name (admin1) |
+| `country` | Country name |
+| `alternate_names` | `alternate_city_names` — Postgres array, SQLite comma-separated |
+| `population` | |
+| `latitude`, `longitude` | Decimal degrees |
+
+```sql
+SELECT * FROM locations WHERE state = 'Maharashtra' ORDER BY population DESC;
+```
+
+### `geonames_states`
+
+| Column | Type | Description |
+|---|---|---|
+| `code` | text | Primary key — `country_code . admin1_code`, e.g. `IN.16` |
+| `country_code` | text | ISO-3166 country code |
+| `admin1_code` | text | GeoNames first-level admin code |
+| `state` | text | State / province name |
+| `ascii_state` | text | ASCII form of the name |
+| `geonameid` | integer | GeoNames identifier of the state itself |
+
+### `geonames_countries`
+
+Loaded straight from `countryInfo.txt`: `country_code` (PK), `iso3`,
+`iso_numeric`, `fips`, `country`, `capital`, `area_sqkm`, `population`,
+`continent`, `tld`, `currency_code`, `currency_name`, `phone`,
+`postal_code_format`, `postal_code_regex`, `languages`, `geonameid`,
+`neighbours`, `equivalent_fips`.
+
+### `geonames_cities`
 
 | Column | Type | Description |
 |---|---|---|
 | `id` | integer | Auto-generated primary key |
-| `geonameid` | integer | Unique GeoNames identifier |
 | `city` | text | City name (English) |
-| `country` | text | ISO-3166 country code |
-| `country_code` | text | ISO-3166 country code (same as `country`) |
-| `region` | text | State / province / first-level admin division |
-| `timezone` | text | IANA timezone string (e.g. `Asia/Kolkata`) |
-| `population` | integer | Population count |
+| `region` | text | District / county (admin2) — `Mumbai Suburban`. Equals `state` when GeoNames has no admin2 for the city |
+| `state` | text | State / province name, resolved from admin1 (`Maharashtra`) |
+| `country` | text | Country name, resolved from `countryInfo.txt` (`India`) |
 | `latitude` | numeric | Decimal degrees |
 | `longitude` | numeric | Decimal degrees |
+| `population` | integer | Population count |
 | `alternate_city_names` | text[] / text | Other names / transliterations (Postgres: array; SQLite: comma-separated) |
+| `timezone` | text | IANA timezone string (e.g. `Asia/Kolkata`) |
+| `country_code` | text | ISO-3166 country code (`IN`) |
+| `state_code` | text | `IN.16` — foreign key to `geonames_states.code` |
+| `geonameid` | integer | Unique GeoNames identifier |
 | `inserted_at` | timestamp | Row creation time |
 | `updated_at` | timestamp | Last modification time |
 
@@ -197,18 +301,57 @@ LIMIT 10;
 SELECT * FROM geonames_cities WHERE country_code = 'IN' ORDER BY population DESC;
 ```
 
-### Filter by state / region
+### Filter by state, or by the finer region
+
+`state` is always the admin1 name. `region` is the admin2 name (district /
+county) when GeoNames has one, and falls back to the state when it does not —
+so the two are equal for cities with no admin2 row.
 
 ```sql
-SELECT * FROM geonames_cities WHERE region = 'Maharashtra' ORDER BY population DESC;
+-- Every city in the state
+SELECT * FROM geonames_cities WHERE state = 'Maharashtra' ORDER BY population DESC;
+
+-- Narrower: just the district
+SELECT * FROM geonames_cities WHERE region = 'Mumbai Suburban' ORDER BY population DESC;
 ```
 
 ### Cities within a state of a country
 
 ```sql
+-- By state code (exact, index-backed)
+SELECT * FROM geonames_cities WHERE state_code = 'IN.16' ORDER BY population DESC;
+
+-- By name
 SELECT * FROM geonames_cities
-WHERE country_code = 'IN' AND region = 'Maharashtra'
+WHERE country_code = 'IN' AND state = 'Maharashtra'
 ORDER BY population DESC;
+```
+
+### List states of a country
+
+```sql
+SELECT code, state FROM geonames_states WHERE country_code = 'IN' ORDER BY state;
+```
+
+### Countries
+
+```sql
+-- All countries in a continent
+SELECT country_code, country, capital, population
+FROM geonames_countries WHERE continent = 'AS' ORDER BY population DESC;
+
+-- Look up a country by name
+SELECT * FROM geonames_countries WHERE country = 'India' COLLATE NOCASE;  -- SQLite
+```
+
+### Fuzzy city search, with state and country attached
+
+```sql
+-- SQLite (FTS5)
+SELECT c.city, c.state, c.country
+FROM geonames_cities c
+JOIN geonames_cities_fts f ON f.rowid = c.id
+WHERE geonames_cities_fts MATCH 'bombay';
 ```
 
 ---
@@ -219,12 +362,15 @@ ORDER BY population DESC;
 |---|---|---|
 | `idx_geonames_cities_city_lower` *(PG)* | `LOWER(city)` | Case-insensitive exact lookup |
 | `idx_geonames_cities_city_trgm` *(PG)* | `city` GIN trigram | `ILIKE` / `similarity()` fuzzy search |
+
 | `idx_geonames_cities_city` *(SQLite)* | `city COLLATE NOCASE` | Case-insensitive exact lookup |
-| `geonames_cities_fts` *(SQLite)* | `city`, `alternate_city_names` | FTS5 full-text / prefix search |
+| `geonames_cities_fts` *(SQLite)* | `city`, `alternate_city_names`, `state`, `region` | FTS5 full-text / prefix search |
+| `idx_geonames_cities_city_ft` *(MySQL)* | `city`, `alternate_city_names`, `state`, `region` | FULLTEXT fuzzy search |
 | `idx_geonames_cities_lat_lon` | `(latitude, longitude)` | Bounding-box proximity queries |
 | `idx_geonames_cities_country_code` | `country_code` | Filter by country |
-| `idx_geonames_cities_region` | `region` | Filter by state |
-| `idx_geonames_cities_country_region` | `(country_code, region)` | Filter by country + state |
+| `idx_geonames_cities_state` | `state` | Filter by state name |
+| `idx_geonames_cities_region` | `region` | Filter by district / county |
+| `idx_geonames_cities_country_state` | `(country_code, state)` | Filter by country + state |
 
 ---
 
@@ -233,12 +379,14 @@ ORDER BY population DESC;
 | Variable | Description | Default |
 |---|---|---|
 | `DB_DRIVER` | Backend: `postgres` or `sqlite` | — (required) |
-| `DATABASE_URL` | PostgreSQL connection URL | — |
+| `DATABASE_URL` | PostgreSQL connection URL — takes precedence over `PG*` | — |
+| `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSERVICE`, … | Standard libpq variables, used when `DATABASE_URL` is empty | psql defaults |
 | `SQLITE_DB_PATH` | Path for the SQLite `.db` file | `./locationdb.db` |
 | `POSTGRES_USER` | docker-compose user *(test mode)* | `locationdb_user` |
 | `POSTGRES_PASSWORD` | docker-compose password *(test mode)* | `changeme` |
 | `POSTGRES_DB` | docker-compose database name *(test mode)* | `locationdb` |
 | `POSTGRES_PORT` | docker-compose host port *(test mode)* | `5432` |
+| `CACHE` | Set to `1` to keep downloaded files in `data/` | `0` (delete after import) |
 
 ---
 
@@ -255,11 +403,14 @@ drivers/
     driver.sh                 PostgreSQL implementation
     sql/01_schema.sql         Tables, indexes, sync tracker
     sql/02_load.sql           Bulk-load (\copy)
-    sql/03_flatten.sql        Flatten staging → geonames_cities
+    sql/03_flatten.sql        Flatten staging → final tables, drop staging
   sqlite/
     driver.sh                 SQLite implementation
     sql/01_schema.sql         Tables, FTS5, indexes, triggers
-    sql/03_flatten.sql        Flatten + FTS5 rebuild
+    sql/03_flatten.sql        Flatten + FTS5 rebuild, drop staging, VACUUM
+tests/
+  test_sqlite.sh              Offline pipeline check on tiny fixtures
+  test_postgres.sh            Same checks against a real Postgres (--test for docker)
 docker-compose.yaml           Local PostgreSQL for testing
 .env.example                  Configuration template
 ```

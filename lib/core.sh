@@ -17,6 +17,16 @@ log_step()    { echo ""; echo "▶   $*"; }
 download_geonames_data() {
   log_step "Downloading GeoNames files..."
   mkdir -p data
+
+  if [[ "${CACHE:-0}" -eq 1 ]] \
+     && [[ -f data/cities1000.txt ]] \
+     && [[ -f data/admin1CodesASCII.txt ]] \
+     && [[ -f data/admin2Codes.txt ]] \
+     && [[ -f data/countryInfo.txt ]]; then
+    log_info "Cache hit — reusing downloaded files in ./data/"
+    return 0
+  fi
+
   (
     cd data
     curl -fsSL -O http://download.geonames.org/export/dump/cities1000.zip
@@ -24,8 +34,11 @@ download_geonames_data() {
 
     curl -fsSL -O http://download.geonames.org/export/dump/admin1CodesASCII.txt
     curl -fsSL -O http://download.geonames.org/export/dump/admin2Codes.txt
-    curl -fsSL -O http://download.geonames.org/export/dump/adminCode5.zip
-    unzip -o adminCode5.zip
+
+    # countryInfo.txt ships with a ~50-line licence/header comment block.
+    # Strip it so the file is pure TSV and loadable by \copy / .import.
+    curl -fsSL http://download.geonames.org/export/dump/countryInfo.txt \
+      | grep -v '^#' > countryInfo.txt
   )
   log_success "GeoNames data ready in ./data/"
 }

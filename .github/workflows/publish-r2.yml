@@ -37,6 +37,8 @@ jobs:
           SHA=$(sha256sum location.db | awk '{print $1}')
           SIZE=$(stat -c%s location.db)
           ROWS_GEONAMES_CITIES=$(sqlite3 location.db "SELECT COUNT(*) FROM geonames_cities;")
+          ROWS_GEONAMES_STATES=$(sqlite3 location.db "SELECT COUNT(*) FROM geonames_states;")
+          ROWS_GEONAMES_COUNTRIES=$(sqlite3 location.db "SELECT COUNT(*) FROM geonames_countries;")
 
           cat > location.json <<EOF
           {
@@ -46,7 +48,9 @@ jobs:
             "size":$SIZE,
             "url":"https://locationdb.utkarshchourasia.in/location.db",
             "rows":{
-              "geonames_cities":$ROWS_GEONAMES_CITIES
+              "geonames_cities":$ROWS_GEONAMES_CITIES,
+              "geonames_states":$ROWS_GEONAMES_STATES,
+              "geonames_countries":$ROWS_GEONAMES_COUNTRIES
             }
           }
           EOF

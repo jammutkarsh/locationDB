@@ -8,6 +8,7 @@
 # -----
 #   ./populate.sh --driver sqlite --db-path ./locationdb.db
 #   ./populate.sh --driver postgres --db-url "postgres://user:pass@host/db"
+#   PGHOST=db PGUSER=me PGDATABASE=locationdb ./populate.sh --driver postgres
 #   ./populate.sh --driver postgres --test    # start docker-compose automatically
 #   ./populate.sh --help
 #
@@ -15,6 +16,8 @@
 # ---------------------
 #   DB_DRIVER       — backend name (postgres | sqlite | ...)
 #   DATABASE_URL    — postgres connection URL
+#   PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE, PGSERVICE, ...
+#                   — standard libpq variables; used when DATABASE_URL is empty
 #   SQLITE_DB_PATH  — sqlite file path  (default: ./locationdb.db)
 #
 # Adding a new backend
@@ -38,6 +41,7 @@ DRIVER="${DB_DRIVER:-}"
 DATABASE_URL="${DATABASE_URL:-}"
 SQLITE_PATH="${SQLITE_DB_PATH:-./locationdb.db}"
 TEST_MODE=0
+CACHE=0
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -53,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --db-url)  DATABASE_URL="$2"; shift 2 ;;
     --db-path) SQLITE_PATH="$2";  shift 2 ;;
     --test)    TEST_MODE=1;       shift   ;;
+    --cache)   CACHE=1;           shift   ;;
     -h|--help) usage ;;
     *) log_error "Unknown flag: $1"; usage ;;
   esac
@@ -115,7 +120,7 @@ download_geonames_data
 db_init
 db_load
 db_flatten
-cleanup
+if [[ "$CACHE" -ne 1 ]]; then cleanup; fi
 
 echo ""
 log_success "Import complete!"

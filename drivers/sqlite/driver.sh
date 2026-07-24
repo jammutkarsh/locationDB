@@ -42,7 +42,7 @@ db_load() {
   _sqlite_import "data/cities1000.txt"       "cities1000"
   _sqlite_import "data/admin1CodesASCII.txt" "admin1Codes"
   _sqlite_import "data/admin2Codes.txt"      "admin2Codes"
-  _sqlite_import "data/adminCode5.txt"       "admin5Codes"
+  _sqlite_import "data/countryInfo.txt"      "geonames_countries"
 }
 
 # Flatten staging tables into the final geonames_cities table

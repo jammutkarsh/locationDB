@@ -61,13 +61,15 @@ db_init() {
 #   data/cities1000.txt
 #   data/admin1CodesASCII.txt
 #   data/admin2Codes.txt
-#   data/adminCode5.txt
+#   data/countryInfo.txt   (comment lines already stripped)
 db_load() {
   log_step "Loading raw data..."
   mysql "$DATABASE_URL" < "$DRIVER_DIR/sql/02_load.sql"
 }
 
-# Join/flatten the staging tables into the final geonames_cities table.
+# Join/flatten staging into geonames_cities / geonames_states /
+# geonames_countries, then DROP the staging tables — the finished database
+# should expose only those three plus the `locations` view and sync_state.
 db_flatten() {
   log_step "Flattening..."
   mysql "$DATABASE_URL" < "$DRIVER_DIR/sql/04_flatten.sql"

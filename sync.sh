@@ -6,6 +6,7 @@
 # Usage
 # -----
 #   ./sync.sh --driver postgres --db-url "postgres://user:pass@host/db"
+#   PGHOST=db PGUSER=me PGDATABASE=locationdb ./sync.sh --driver postgres
 #   ./sync.sh --driver postgres --test    # start docker-compose automatically
 #   ./sync.sh --help
 #
@@ -13,6 +14,8 @@
 # ---------------------
 #   DB_DRIVER      — backend name
 #   DATABASE_URL   — postgres connection URL
+#   PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE, PGSERVICE, ...
+#                  — standard libpq variables; used when DATABASE_URL is empty
 #   SQLITE_DB_PATH — sqlite file path
 #
 # Adding a new backend
@@ -37,6 +40,7 @@ DRIVER="${DB_DRIVER:-}"
 DATABASE_URL="${DATABASE_URL:-}"
 SQLITE_PATH="${SQLITE_DB_PATH:-./locationdb.db}"
 TEST_MODE=0
+CACHE=0
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -52,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --db-url)  DATABASE_URL="$2"; shift 2 ;;
     --db-path) SQLITE_PATH="$2";  shift 2 ;;
     --test)    TEST_MODE=1;       shift   ;;
+    --cache)   CACHE=1;           shift   ;;
     -h|--help) usage ;;
     *) log_error "Unknown flag: $1"; usage ;;
   esac
@@ -120,4 +125,4 @@ log_info "Syncing delta for: $DATE"
 
 db_sync "$DATE"
 
-cleanup
+if [[ "$CACHE" -ne 1 ]]; then cleanup; fi

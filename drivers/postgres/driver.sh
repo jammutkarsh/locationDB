@@ -6,7 +6,14 @@
 #
 # Expected environment variables (set by the orchestrator):
 #   DRIVER_DIR   — absolute path to this driver's directory
-#   DATABASE_URL — postgres connection string
+#   DATABASE_URL — postgres connection string (optional, see below)
+#
+# Two ways to point this driver at a database:
+#   1. Standard libpq variables — PGHOST, PGPORT, PGUSER, PGPASSWORD,
+#      PGDATABASE, PGSERVICE, PGSSLMODE, ~/.pgpass, ~/.pg_service.conf.
+#      Leave DATABASE_URL empty and psql picks them up itself.
+#   2. A connection string via DATABASE_URL or --db-url.
+# If both are given, DATABASE_URL wins.
 
 # ---------------------------------------------------------------------------
 # Interface implementation
@@ -21,29 +28,45 @@ db_check_deps() {
   require_cmd "curl" "Install curl to download GeoNames data."
   require_cmd "unzip"
 
-  if [[ -z "${DATABASE_URL:-}" ]]; then
-    log_error "DATABASE_URL is not set."
-    log_error "Export it or pass --db-url <postgres://user:pass@host/db>"
+  if [[ -n "${DATABASE_URL:-}" ]]; then
+    log_info "Connecting via DATABASE_URL"
+  elif [[ -n "${PGSERVICE:-}${PGHOST:-}${PGDATABASE:-}${PGUSER:-}" ]]; then
+    log_info "Connecting via PG* environment variables (PGHOST=${PGHOST:-local socket}, PGDATABASE=${PGDATABASE:-$(id -un)})"
+  else
+    log_error "No PostgreSQL connection configured. Use either:"
+    log_error "  1. PG* variables — export PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE"
+    log_error "  2. A connection string — export DATABASE_URL or pass --db-url <postgres://user:pass@host/db>"
     exit 1
+  fi
+}
+
+# Run psql against the configured target.
+# With DATABASE_URL set, pass it explicitly; otherwise pass nothing and let
+# psql resolve the connection from PG* / .pgpass / .pg_service.conf itself.
+_pg() {
+  if [[ -n "${DATABASE_URL:-}" ]]; then
+    psql "$DATABASE_URL" "$@"
+  else
+    psql "$@"
   fi
 }
 
 # Create schema (staging tables + final output table + sync tracker)
 db_init() {
   log_step "Creating schema..."
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$DRIVER_DIR/sql/01_schema.sql"
+  _pg -v ON_ERROR_STOP=1 -f "$DRIVER_DIR/sql/01_schema.sql"
 }
 
 # Bulk-load raw GeoNames TSV files into staging tables
 db_load() {
   log_step "Loading raw data..."
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$DRIVER_DIR/sql/02_load.sql"
+  _pg -v ON_ERROR_STOP=1 -f "$DRIVER_DIR/sql/02_load.sql"
 }
 
 # Flatten staging tables into the final geonames_cities table
 db_flatten() {
   log_step "Flattening into final table..."
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$DRIVER_DIR/sql/03_flatten.sql"
+  _pg -v ON_ERROR_STOP=1 -f "$DRIVER_DIR/sql/03_flatten.sql"
 }
 
 # Postgres supports incremental daily sync
@@ -51,12 +74,15 @@ db_supports_sync() { return 0; }
 
 # Apply a single day's GeoNames delta (modifications + deletions)
 # Arguments: $1 = date string YYYY-MM-DD
+# Note: only geonames_cities is delta-synced. geonames_states and
+#       geonames_countries change a handful of times a year — re-run
+#       populate.sh to refresh them.
 db_sync() {
   local date="$1"
 
   # Check whether we are already up-to-date
   local last_sync
-  last_sync=$(psql "$DATABASE_URL" -t -A -c \
+  last_sync=$(_pg -t -A -c \
     "SELECT COALESCE(
        (SELECT last_synced FROM sync_state WHERE name='cities1000'),
        '2025-09-15'
@@ -82,7 +108,7 @@ db_sync() {
     log_info "Deleting removed rows from geonames_cities..."
     local ids
     ids=$(awk '{printf "%s,", $1}' data/deletes.txt | sed 's/,$//')
-    psql "$DATABASE_URL" -c \
+    _pg -c \
       "DELETE FROM geonames_cities
        WHERE geonameid IN (SELECT unnest(ARRAY[${ids}]::bigint[]));"
   fi
@@ -90,7 +116,7 @@ db_sync() {
   # Upsert modifications
   if [[ -s data/mods.txt ]]; then
     log_info "Upserting modified rows into geonames_cities..."
-    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<EOF
+    _pg -v ON_ERROR_STOP=1 <<EOF
       CREATE TEMP TABLE tmp_mods (
         geonameid       bigint,
         name            text,
@@ -116,18 +142,31 @@ db_sync() {
       \copy tmp_mods FROM 'data/mods.txt' WITH (FORMAT text, DELIMITER E'\t', NULL '');
 
       INSERT INTO geonames_cities (
-        geonameid, city, country, timezone, population,
-        latitude, longitude, country_code, alternate_city_names, region
+        city, region, state, country, latitude, longitude, population,
+        alternate_city_names, timezone, country_code, state_code, geonameid
       )
-      SELECT DISTINCT ON (geonameid)
-        geonameid, name, country_code, timezone, population,
-        latitude, longitude, country_code,
-        COALESCE(string_to_array(NULLIF(alternatenames,''),','), ARRAY[]::text[]),
-        admin1_code
-      FROM tmp_mods
-      ORDER BY geonameid, modification_date DESC
+      SELECT DISTINCT ON (m.geonameid)
+        m.name,
+        -- Resolve state and country names from the reference tables; fall back
+        -- to the raw codes when GeoNames has no matching row. The delta feed
+        -- carries no admin2 name, so region tracks the state here.
+        COALESCE(s.state, m.admin1_code),
+        COALESCE(s.state, m.admin1_code),
+        COALESCE(o.country, m.country_code),
+        m.latitude, m.longitude, m.population,
+        COALESCE(string_to_array(NULLIF(m.alternatenames,''),','), ARRAY[]::text[]),
+        m.timezone, m.country_code,
+        m.country_code || '.' || m.admin1_code,
+        m.geonameid
+      FROM tmp_mods m
+      LEFT JOIN geonames_states s
+        ON s.code = m.country_code || '.' || m.admin1_code
+      LEFT JOIN geonames_countries o
+        ON o.country_code = m.country_code
+      ORDER BY m.geonameid, m.modification_date DESC
       ON CONFLICT (geonameid) DO UPDATE SET
         city                 = EXCLUDED.city,
+        state                = EXCLUDED.state,
         country              = EXCLUDED.country,
         timezone             = COALESCE(EXCLUDED.timezone, 'UTC'),
         population           = EXCLUDED.population,
@@ -135,7 +174,11 @@ db_sync() {
         longitude            = EXCLUDED.longitude,
         country_code         = EXCLUDED.country_code,
         alternate_city_names = COALESCE(EXCLUDED.alternate_city_names, ARRAY[]::text[]),
-        region               = EXCLUDED.region,
+        -- ponytail: delta has no admin2, keep existing when resolved beyond state
+        region               = CASE WHEN geonames_cities.region = geonames_cities.state
+                                    THEN EXCLUDED.region
+                                    ELSE geonames_cities.region END,
+        state_code           = EXCLUDED.state_code,
         updated_at           = now();
 EOF
   fi
@@ -148,7 +191,7 @@ EOF
 # Private helpers (prefix with _pg_ to avoid collisions across drivers)
 # ---------------------------------------------------------------------------
 _pg_record_sync() {
-  psql "$DATABASE_URL" -c "
+  _pg -c "
     INSERT INTO sync_state (name, last_synced)
     VALUES ('cities1000', DATE '$1')
     ON CONFLICT (name) DO UPDATE SET last_synced = EXCLUDED.last_synced;"

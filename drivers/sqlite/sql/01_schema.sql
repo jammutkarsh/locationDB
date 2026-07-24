@@ -5,6 +5,7 @@
 --   • datetime('now') instead of now()
 --   • No CASCADE on DROP (SQLite ignores it anyway)
 
+DROP VIEW IF EXISTS locations;
 DROP TRIGGER IF EXISTS geonames_cities_ai;
 DROP TRIGGER IF EXISTS geonames_cities_ad;
 DROP TRIGGER IF EXISTS geonames_cities_au;
@@ -12,11 +13,13 @@ DROP TABLE IF EXISTS geonames_cities_fts;
 DROP TABLE IF EXISTS cities1000;
 DROP TABLE IF EXISTS admin1Codes;
 DROP TABLE IF EXISTS admin2Codes;
-DROP TABLE IF EXISTS admin5Codes;
 DROP TABLE IF EXISTS sync_state;
 DROP TABLE IF EXISTS geonames_cities;
+DROP TABLE IF EXISTS geonames_states;
+DROP TABLE IF EXISTS geonames_countries;
 
--- Raw GeoNames staging tables
+-- Raw GeoNames staging tables — dropped again at the end of 03_flatten.sql,
+-- they only exist while the import runs.
 CREATE TABLE cities1000 (
     geonameid     INTEGER PRIMARY KEY,
     name          TEXT,
@@ -53,11 +56,6 @@ CREATE TABLE admin2Codes (
     geonameid INTEGER
 );
 
-CREATE TABLE admin5Codes (
-    geonameid INTEGER,
-    adm5code  TEXT
-);
-
 -- Incremental-sync state tracker
 CREATE TABLE sync_state (
     name        TEXT PRIMARY KEY,
@@ -77,17 +75,58 @@ CREATE INDEX IF NOT EXISTS idx_cities_cc     ON cities1000 (country_code);
 CREATE TABLE geonames_cities (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     city                 TEXT,
-    country              TEXT,
-    timezone             TEXT,
-    population           INTEGER DEFAULT 0,
+    region               TEXT,   -- admin2 name if present, else the state
+    state                TEXT,   -- resolved admin1 name, e.g. 'Maharashtra'
+    country              TEXT,   -- resolved country name, e.g. 'India'
     latitude             REAL,
     longitude            REAL,
-    country_code         TEXT,
+    population           INTEGER DEFAULT 0,
     alternate_city_names TEXT,
+    timezone             TEXT,
+    country_code         TEXT,
+    state_code           TEXT,   -- 'IN.16' — joins to geonames_states.code
+    geonameid            INTEGER UNIQUE,
     inserted_at          TEXT DEFAULT (datetime('now')),
-    updated_at           TEXT DEFAULT (datetime('now')),
-    region               TEXT,
-    geonameid            INTEGER UNIQUE
+    updated_at           TEXT DEFAULT (datetime('now'))
+);
+
+-- -------------------------------------------------------------------------
+-- Countries — loaded directly from GeoNames countryInfo.txt (19 columns,
+-- in file order: .import maps them positionally, so do not reorder).
+-- -------------------------------------------------------------------------
+CREATE TABLE geonames_countries (
+    country_code       TEXT PRIMARY KEY,   -- ISO-3166 alpha-2
+    iso3               TEXT,
+    iso_numeric        TEXT,
+    fips               TEXT,
+    country            TEXT,
+    capital            TEXT,
+    area_sqkm          REAL,
+    population         INTEGER,
+    continent          TEXT,               -- AF AS EU NA OC SA AN
+    tld                TEXT,
+    currency_code      TEXT,
+    currency_name      TEXT,
+    phone              TEXT,
+    postal_code_format TEXT,
+    postal_code_regex  TEXT,
+    languages          TEXT,               -- comma-separated locale codes
+    geonameid          INTEGER,
+    neighbours         TEXT,               -- comma-separated country codes
+    equivalent_fips    TEXT
+);
+
+-- -------------------------------------------------------------------------
+-- States / provinces — GeoNames first-level admin divisions (admin1).
+-- Filled from the admin1Codes staging table in 03_flatten.sql.
+-- -------------------------------------------------------------------------
+CREATE TABLE geonames_states (
+    code         TEXT PRIMARY KEY,   -- 'IN.16'  (country_code . admin1_code)
+    country_code TEXT,
+    admin1_code  TEXT,
+    state        TEXT,
+    ascii_state  TEXT,
+    geonameid    INTEGER
 );
 
 -- -------------------------------------------------------------------------
@@ -116,6 +155,8 @@ CREATE INDEX IF NOT EXISTS idx_geonames_cities_city
 CREATE VIRTUAL TABLE geonames_cities_fts USING fts5(
     city,
     alternate_city_names,
+    state,
+    region,
     content='geonames_cities',
     content_rowid='id'
 );
@@ -123,20 +164,20 @@ CREATE VIRTUAL TABLE geonames_cities_fts USING fts5(
 -- Triggers keep the FTS5 index in sync with geonames_cities for
 -- incremental updates (inserts, deletes, edits after the initial load).
 CREATE TRIGGER geonames_cities_ai AFTER INSERT ON geonames_cities BEGIN
-    INSERT INTO geonames_cities_fts(rowid, city, alternate_city_names)
-    VALUES (new.id, new.city, new.alternate_city_names);
+    INSERT INTO geonames_cities_fts(rowid, city, alternate_city_names, state, region)
+    VALUES (new.id, new.city, new.alternate_city_names, new.state, new.region);
 END;
 
 CREATE TRIGGER geonames_cities_ad AFTER DELETE ON geonames_cities BEGIN
-    INSERT INTO geonames_cities_fts(geonames_cities_fts, rowid, city, alternate_city_names)
-    VALUES ('delete', old.id, old.city, old.alternate_city_names);
+    INSERT INTO geonames_cities_fts(geonames_cities_fts, rowid, city, alternate_city_names, state, region)
+    VALUES ('delete', old.id, old.city, old.alternate_city_names, old.state, old.region);
 END;
 
 CREATE TRIGGER geonames_cities_au AFTER UPDATE ON geonames_cities BEGIN
-    INSERT INTO geonames_cities_fts(geonames_cities_fts, rowid, city, alternate_city_names)
-    VALUES ('delete', old.id, old.city, old.alternate_city_names);
-    INSERT INTO geonames_cities_fts(rowid, city, alternate_city_names)
-    VALUES (new.id, new.city, new.alternate_city_names);
+    INSERT INTO geonames_cities_fts(geonames_cities_fts, rowid, city, alternate_city_names, state, region)
+    VALUES ('delete', old.id, old.city, old.alternate_city_names, old.state, old.region);
+    INSERT INTO geonames_cities_fts(rowid, city, alternate_city_names, state, region)
+    VALUES (new.id, new.city, new.alternate_city_names, new.state, new.region);
 END;
 
 -- -------------------------------------------------------------------------
@@ -150,23 +191,46 @@ CREATE INDEX IF NOT EXISTS idx_geonames_cities_lat_lon
 -- -------------------------------------------------------------------------
 -- Query 3: Filter by country
 --   WHERE country_code = 'IN'
---   Note: country and country_code both store the ISO-3166 code.
---         Indexing country_code covers both columns.
+--   `country` holds the resolved name ('India'), `country_code` the ISO
+--   code ('IN'). Filter on country_code — it is the indexed one.
 -- -------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_geonames_cities_country_code
     ON geonames_cities (country_code);
 
 -- -------------------------------------------------------------------------
--- Query 4: Filter by state / region
---   WHERE region = 'Maharashtra'
+-- Query 4: Filter by state, or by the finer region (admin2)
+--   WHERE state  = 'Maharashtra'     COLLATE NOCASE
+--   WHERE region = 'Mumbai Suburban' COLLATE NOCASE
+--   region equals state for cities GeoNames gives no admin2 for.
 -- -------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_geonames_cities_state
+    ON geonames_cities (state COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_geonames_cities_region
-    ON geonames_cities (region);
+    ON geonames_cities (region COLLATE NOCASE);
 
 -- -------------------------------------------------------------------------
 -- Query 5: Cities within a specific state of a specific country
---   WHERE country_code = 'IN' AND region = 'Maharashtra'
+--   WHERE country_code = 'IN' AND state = 'Maharashtra'
 --   The composite covers single-country filters too (leading column rule).
 -- -------------------------------------------------------------------------
-CREATE INDEX IF NOT EXISTS idx_geonames_cities_country_region
-    ON geonames_cities (country_code, region);
+CREATE INDEX IF NOT EXISTS idx_geonames_cities_country_state
+    ON geonames_cities (country_code, state);
+
+-- -------------------------------------------------------------------------
+-- The eight columns most callers actually want, nothing else.
+-- Plain projection of geonames_cities — no joins, so it uses that table's
+-- indexes directly:
+--   SELECT * FROM locations WHERE city = 'Mumbai' COLLATE NOCASE;
+-- -------------------------------------------------------------------------
+CREATE VIEW locations AS
+SELECT
+    id,
+    city,
+    region,
+    state,
+    country,
+    latitude,
+    longitude,
+    population,
+    alternate_city_names AS alternate_names
+FROM geonames_cities;
