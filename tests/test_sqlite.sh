@@ -120,6 +120,27 @@ assert_eq "$(q "SELECT s.state FROM geonames_cities c
                 WHERE c.city = 'Mumbai';")" \
           "Maharashtra" "geonames_cities JOIN geonames_states via state_code"
 
+# Trigram index for typo-tolerant search
+assert_eq "$(q "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='geonames_trigrams';")" \
+          "1" "geonames_trigrams table exists"
+assert_eq "$(q "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_trigram_lookup';")" \
+          "1" "trigram index exists"
+
+TRIGRAM_COUNT=$(q 'SELECT COUNT(*) FROM geonames_trigrams;')
+if [[ "$TRIGRAM_COUNT" -lt 15 ]]; then
+  echo "FAIL: expected >=15 trigrams for 2 test cities, got $TRIGRAM_COUNT"
+  exit 1
+fi
+# Spot-check known trigrams
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=1 AND trigram='mum';")" \
+          "1" "trigram 'mum' for Mumbai"
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=1 AND trigram='bom';")" \
+          "1" "trigram 'bom' for Mumbai (from alt Bombay)"
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=2 AND trigram='new';")" \
+          "1" "trigram 'new' for New York City"
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=2 AND trigram='nyc';")" \
+          "1" "trigram 'nyc' for New York City (from alt NYC)"
+
 # --cache: cleanup must be skippable so downloaded Geonames files survive.
 # Simulate a fresh data/ dir (the real cleanup deleted the one from db_load).
 mkdir -p data && touch data/testfile.txt

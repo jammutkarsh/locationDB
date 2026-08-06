@@ -10,6 +10,7 @@ DROP TRIGGER IF EXISTS geonames_cities_ai;
 DROP TRIGGER IF EXISTS geonames_cities_ad;
 DROP TRIGGER IF EXISTS geonames_cities_au;
 DROP TABLE IF EXISTS geonames_cities_fts;
+DROP TABLE IF EXISTS geonames_trigrams;
 DROP TABLE IF EXISTS cities1000;
 DROP TABLE IF EXISTS admin1Codes;
 DROP TABLE IF EXISTS admin2Codes;
@@ -180,7 +181,30 @@ CREATE TRIGGER geonames_cities_au AFTER UPDATE ON geonames_cities BEGIN
     VALUES (new.id, new.city, new.alternate_city_names, new.state, new.region);
 END;
 
--- -------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- Query 1c: Trigram index for typo-tolerant fuzzy search
+--
+-- Each city name + its alternates are decomposed into all 3-char substrings
+-- (trigrams). The wandersort client decomposes the user's query the same way
+-- and finds matches via overlapping trigrams:
+--
+--   SELECT gc.*, COUNT(*) as score
+--   FROM geonames_trigrams gt
+--   JOIN geonames_cities gc ON gc.id = gt.city_id
+--   WHERE gt.trigram IN (' ka','kat','ath','thm','hma','man','and','ndu','du ')
+--   GROUP BY gt.city_id
+--   ORDER BY score DESC LIMIT 8
+--
+-- A primary key (trigram, city_id) auto-indexes the join column city_id.
+-- ---------------------------------------------------------------------------
+CREATE TABLE geonames_trigrams (
+    trigram  TEXT    NOT NULL,
+    city_id  INTEGER NOT NULL,
+    PRIMARY KEY (trigram, city_id)
+);
+CREATE INDEX idx_trigram_lookup ON geonames_trigrams(trigram);
+
+-- ---------------------------------------------------------------------------
 -- Query 2: Proximity / reverse-geocoding by lat & long
 --   Bounding box:  WHERE latitude  BETWEEN $lat - $d AND $lat + $d
 --                  AND   longitude BETWEEN $lon - $d AND $lon + $d

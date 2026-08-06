@@ -73,6 +73,49 @@ CREATE TRIGGER geonames_cities_au AFTER UPDATE ON geonames_cities BEGIN
     VALUES (new.id, new.city, new.alternate_city_names, new.state, new.region);
 END;
 
+-- ---------------------------------------------------------------------------
+-- Trigram index: decompose every city name + asciiname + alternate names into
+-- 3-char substrings for typo-tolerant fuzzy search.
+--
+-- We join back to the cities1000 staging table (still present) to grab
+-- asciiname (diacritic-free) and alternatenames (comma-separated).
+-- ---------------------------------------------------------------------------
+INSERT OR IGNORE INTO geonames_trigrams (trigram, city_id)
+WITH RECURSIVE
+  pos(n) AS (
+    VALUES(1)
+    UNION ALL
+    SELECT n+1 FROM pos WHERE n < 100
+  ),
+  alt_split(geonameid, name, rest) AS (
+    SELECT geonameid,
+           trim(substr(alternatenames, 1, instr(alternatenames||',',',')-1)),
+           substr(alternatenames, instr(alternatenames||',',',')+1)
+    FROM cities1000
+    WHERE alternatenames IS NOT NULL AND alternatenames != ''
+    UNION ALL
+    SELECT geonameid,
+           trim(substr(rest, 1, instr(rest||',',',')-1)),
+           substr(rest, instr(rest||',',',')+1)
+    FROM alt_split WHERE rest != ''
+  ),
+  names(city_id, name) AS (
+    SELECT id, lower(city) FROM geonames_cities
+    UNION
+    SELECT gc.id, lower(c.asciiname)
+    FROM geonames_cities gc
+    JOIN cities1000 c ON c.geonameid = gc.geonameid
+    WHERE lower(c.asciiname) != lower(gc.city)
+    UNION
+    SELECT gc.id, lower(s.name)
+    FROM alt_split s
+    JOIN geonames_cities gc ON gc.geonameid = s.geonameid
+    WHERE s.name != ''
+  )
+SELECT substr('  ' || name || '  ', pos.n, 3), city_id
+FROM names CROSS JOIN pos
+WHERE length(substr('  ' || name || '  ', pos.n, 3)) = 3;
+
 -- Staging tables have served their purpose — neither populate nor sync reads
 -- them again. Drop them and reclaim the pages, so the shipped .db holds only
 -- geonames_cities / _states / _countries (+ FTS index, locations view, sync_state).
