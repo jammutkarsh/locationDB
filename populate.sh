@@ -120,6 +120,10 @@ download_geonames_data
 db_init
 db_load
 db_flatten
+# Compress the built database for distribution (driver-optional)
+if declare -f db_compress >/dev/null 2>&1; then
+  db_compress
+fi
 if [[ "$CACHE" -ne 1 ]]; then cleanup; fi
 
 echo ""

@@ -51,6 +51,13 @@ db_flatten() {
   sqlite3 "$SQLITE_PATH" < "$DRIVER_DIR/sql/03_flatten.sql"
 }
 
+# Compress the built database for distribution
+db_compress() {
+  log_step "Compressing database..."
+  gzip -f -k "$SQLITE_PATH"
+  log_info "Compressed: ${SQLITE_PATH}.gz ($(du -h "$SQLITE_PATH.gz" | cut -f1))"
+}
+
 # SQLite does not support incremental sync
 db_supports_sync() { return 1; }
 
