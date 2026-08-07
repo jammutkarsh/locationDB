@@ -20,6 +20,7 @@ db_check_deps() {
   require_cmd "sqlite3" "Install SQLite3: https://www.sqlite.org/download.html"
   require_cmd "curl"    "Install curl to download GeoNames data."
   require_cmd "unzip"
+  require_cmd "zstd"    "Install zstd to compress the built database."
 
   if [[ -z "${SQLITE_PATH:-}" ]]; then
     log_error "SQLITE_PATH is not set."
@@ -51,11 +52,18 @@ db_flatten() {
   sqlite3 "$SQLITE_PATH" < "$DRIVER_DIR/sql/03_flatten.sql"
 }
 
-# Compress the built database for distribution (xz: 4.1x vs gzip 2.5x)
+# Compress the built database for distribution. zstd over xz: decode speed
+# barely moves with compression level (unlike xz), and a pure-Go zstd
+# decoder still runs orders of magnitude faster than a pure-Go xz decoder —
+# the client (wandersort) decodes this on every install, in pure Go, so
+# decode speed there matters more than a few percent of compression ratio.
+# -19 is zstd's practical ceiling before "--ultra" levels, which cost much
+# longer encode time here for a couple % smaller output and no decode-speed
+# benefit.
 db_compress() {
   log_step "Compressing database..."
-  xz -f -k "$SQLITE_PATH"
-  log_info "Compressed: ${SQLITE_PATH}.xz ($(du -h "$SQLITE_PATH.xz" | cut -f1))"
+  zstd -19 -f -k "$SQLITE_PATH" -o "$SQLITE_PATH.zst"
+  log_info "Compressed: ${SQLITE_PATH}.zst ($(du -h "$SQLITE_PATH.zst" | cut -f1))"
 }
 
 # SQLite does not support incremental sync

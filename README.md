@@ -113,9 +113,9 @@ A compressed, ready-to-use SQLite database is published daily to Cloudflare R2
 and served via CDN. It includes all tables, indexes, and the trigram index.
 
 ```bash
-curl -O https://locationdb.utkarshchourasia.in/location.db.xz
-xz -d location.db.xz
-# location.db is ~350 MB decompressed, ready for queries
+curl -O https://locationdb.utkarshchourasia.in/location.db.zst
+zstd -d location.db.zst
+# location.db is ~400 MB decompressed, ready for queries
 ```
 
 Metadata available at `https://locationdb.utkarshchourasia.in/location.json`:
