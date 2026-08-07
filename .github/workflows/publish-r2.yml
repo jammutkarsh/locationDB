@@ -16,7 +16,7 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y sqlite3 curl unzip
+          sudo apt-get install -y sqlite3 curl unzip xz-utils
 
       - name: Install AWS CLI
         run: |
@@ -35,10 +35,13 @@ jobs:
       - name: Generate metadata
         run: |
           SHA=$(sha256sum location.db | awk '{print $1}')
+          XZ_SHA=$(sha256sum location.db.xz | awk '{print $1}')
           SIZE=$(stat -c%s location.db)
+          XZ_SIZE=$(stat -c%s location.db.xz)
           ROWS_GEONAMES_CITIES=$(sqlite3 location.db "SELECT COUNT(*) FROM geonames_cities;")
           ROWS_GEONAMES_STATES=$(sqlite3 location.db "SELECT COUNT(*) FROM geonames_states;")
           ROWS_GEONAMES_COUNTRIES=$(sqlite3 location.db "SELECT COUNT(*) FROM geonames_countries;")
+          ROWS_GEONAMES_TRIGRAMS=$(sqlite3 location.db "SELECT COUNT(*) FROM geonames_trigrams;")
 
           cat > location.json <<EOF
           {
@@ -46,21 +49,27 @@ jobs:
             "updated":"$(date -u +%FT%TZ)",
             "sha256":"$SHA",
             "size":$SIZE,
-            "url":"https://locationdb.utkarshchourasia.in/location.db",
+            "xz": {
+              "sha256":"$XZ_SHA",
+              "size":$XZ_SIZE,
+              "url":"https://locationdb.utkarshchourasia.in/location.db.xz"
+            },
             "rows":{
               "geonames_cities":$ROWS_GEONAMES_CITIES,
               "geonames_states":$ROWS_GEONAMES_STATES,
-              "geonames_countries":$ROWS_GEONAMES_COUNTRIES
+              "geonames_countries":$ROWS_GEONAMES_COUNTRIES,
+              "geonames_trigrams":$ROWS_GEONAMES_TRIGRAMS
             }
           }
           EOF
 
-      - name: Upload DB
+      - name: Upload to R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
-          aws s3 cp location.db s3://locationdb/location.db
-          aws s3 cp location.json s3://locationdb/location.json
+          aws s3 cp location.db    s3://locationdb/location.db
+          aws s3 cp location.db.xz s3://locationdb/location.db.xz
+          aws s3 cp location.json  s3://locationdb/location.json
