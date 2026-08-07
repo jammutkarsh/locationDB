@@ -4,8 +4,8 @@ A script that downloads the public [GeoNames](https://www.geonames.org/) dataset
 and loads it into a local database — ready to query by city name, country, state,
 or geographic coordinates.
 
-Supports **PostgreSQL** and **SQLite** out of the box. Adding a new backend
-requires only a single driver file; the orchestrator scripts never need to change.
+Supports **PostgreSQL**, **SQLite**, and **MySQL** out of the box. Adding a new
+backend requires only a single driver file; the orchestrator scripts never need to change.
 
 ---
 
@@ -31,13 +31,14 @@ place names.
 
 ## Requirements
 
-| Tool | SQLite | PostgreSQL |
-|---|---|---|
-| `curl` | ✅ | ✅ |
-| `unzip` | ✅ | ✅ |
-| `sqlite3` | ✅ | — |
-| `psql` (PostgreSQL client) | — | ✅ |
-| Docker + `docker-compose` | — | only for `--test` mode |
+| Tool | SQLite | PostgreSQL | MySQL |
+|---|---|---|---|
+| `curl` | ✅ | ✅ | ✅ |
+| `unzip` | ✅ | ✅ | ✅ |
+| `sqlite3` | ✅ | — | — |
+| `psql` (PostgreSQL client) | — | ✅ | — |
+| `mysql` (MySQL client) | — | — | ✅ |
+| Docker + `docker-compose` | — | only for `--test` mode | — |
 
 ---
 
@@ -91,6 +92,35 @@ export PGHOST=db.example.com PGPORT=5432 \
 # Starts a Postgres container, runs the import, leaves the container running.
 ```
 
+#### MySQL — remote server
+
+Two ways to point it at a database; `DATABASE_URL` wins if both are set.
+
+```bash
+# 1 — standard MYSQL_* variables (also honours ~/.my.cnf)
+export MYSQL_HOST=db.example.com MYSQL_USER=locationdb_user \
+       MYSQL_PASSWORD=secret MYSQL_DATABASE=locationdb
+./populate.sh --driver mysql
+
+# 2 — a connection string
+./populate.sh --driver mysql \
+  --db-url "mysql://user:pass@host:3306/dbname"
+```
+
+#### Pre-built SQLite database (skip the import)
+
+A compressed, ready-to-use SQLite database is published daily to Cloudflare R2
+and served via CDN. It includes all tables, indexes, and the trigram index.
+
+```bash
+curl -O https://locationdb.utkarshchourasia.in/location.db.xz
+xz -d location.db.xz
+# location.db is ~350 MB decompressed, ready for queries
+```
+
+Metadata available at `https://locationdb.utkarshchourasia.in/location.json`:
+row counts, SHA-256 checksums, last-updated timestamp.
+
 #### Using environment variables instead of flags
 
 ```bash
@@ -104,7 +134,8 @@ export SQLITE_DB_PATH=./locationdb.db
 ## Daily incremental sync
 
 Keeps the database up-to-date with GeoNames' daily modification and deletion
-feeds. **PostgreSQL only** — SQLite users re-run `populate.sh`.
+feeds. **PostgreSQL and MySQL** — SQLite users re-run `populate.sh` or download
+the pre-built database.
 
 ```bash
 # Remote server
@@ -123,6 +154,10 @@ export DATABASE_URL="postgres://user:pass@host:5432/dbname?sslmode=disable"
 export DB_DRIVER=postgres
 export PGHOST=db.example.com PGUSER=locationdb_user PGDATABASE=locationdb
 ./sync.sh
+
+# MySQL
+./sync.sh --driver mysql \
+  --db-url "mysql://user:pass@host:3306/dbname"
 ```
 
 Only `geonames_cities` is delta-synced. States and countries change a handful
@@ -151,9 +186,10 @@ Both backends produce the same three tables plus one flat view:
 | `locations` *(view)* | ~150k | The columns most callers want — slim projection of `geonames_cities` |
 
 Plus `sync_state` (one row, tracks the last applied delta) and, on SQLite,
-the `geonames_cities_fts` index. The raw GeoNames staging tables exist only
-while `populate.sh` runs; they are dropped at the end of the import (SQLite
-also `VACUUM`s), so the finished database contains nothing else.
+the `geonames_cities_fts` index and `geonames_trigrams` table for fuzzy search.
+The raw GeoNames staging tables exist only while `populate.sh` runs; they are
+dropped at the end of the import (SQLite also `VACUUM`s), so the finished
+database contains nothing else.
 
 `geonames_cities` already carries the resolved **state** and **country
 names** — no join needed for the common case:
@@ -162,6 +198,7 @@ names** — no join needed for the common case:
 SELECT city, region, state, country, population FROM geonames_cities
 WHERE city = 'Mumbai' COLLATE NOCASE;      -- SQLite
 -- WHERE LOWER(city) = LOWER('Mumbai');    -- PostgreSQL
+-- WHERE city = 'Mumbai';                  -- MySQL (collation handles case)
 
 -- city    | region          | state       | country | population
 -- Mumbai  | Mumbai Suburban | Maharashtra | India   | 12691836
@@ -249,6 +286,9 @@ SELECT * FROM geonames_cities WHERE LOWER(city) = LOWER('Mumbai');
 
 -- SQLite
 SELECT * FROM geonames_cities WHERE city = 'Mumbai' COLLATE NOCASE;
+
+-- MySQL (utf8mb4_unicode_ci handles case-insensitivity automatically)
+SELECT * FROM geonames_cities WHERE city = 'Mumbai';
 ```
 
 ### City name — fuzzy / partial (PostgreSQL)
@@ -261,6 +301,18 @@ SELECT * FROM geonames_cities WHERE city ILIKE '%bom%' ORDER BY population DESC;
 SELECT *, similarity(city, 'Bombay') AS score
 FROM geonames_cities
 WHERE similarity(city, 'Bombay') > 0.3
+ORDER BY score DESC;
+```
+
+### City name — fuzzy (MySQL)
+
+```sql
+-- Uses the FULLTEXT index automatically
+SELECT *, MATCH(city, alternate_city_names, state, region)
+       AGAINST('bombay' IN NATURAL LANGUAGE MODE) AS score
+FROM geonames_cities
+WHERE MATCH(city, alternate_city_names, state, region)
+      AGAINST('bombay' IN NATURAL LANGUAGE MODE)
 ORDER BY score DESC;
 ```
 
@@ -280,6 +332,20 @@ FROM geonames_cities gc
 JOIN geonames_cities_fts fts ON fts.rowid = gc.id
 WHERE geonames_cities_fts MATCH 'bombay'
 ORDER BY rank;
+```
+
+### City name — typo-tolerant trigram search (SQLite)
+
+```sql
+-- Decomposes query into 3-char trigrams, ranks by overlap count.
+-- Handles typos and partial matches (e.g. "kathmandu" → Kathmandu).
+SELECT gc.*, COUNT(*) AS score
+FROM geonames_trigrams gt
+JOIN geonames_cities gc ON gc.id = gt.city_id
+WHERE gt.trigram IN (' ka','kat','ath','thm','hma','man','and','ndu','du ')
+GROUP BY gt.city_id
+ORDER BY score DESC
+LIMIT 8;
 ```
 
 ### Proximity — find cities near a point
@@ -342,6 +408,7 @@ FROM geonames_countries WHERE continent = 'AS' ORDER BY population DESC;
 
 -- Look up a country by name
 SELECT * FROM geonames_countries WHERE country = 'India' COLLATE NOCASE;  -- SQLite
+-- MySQL: case-insensitive via utf8mb4_unicode_ci, no COLLATE needed
 ```
 
 ### Fuzzy city search, with state and country attached
@@ -352,6 +419,21 @@ SELECT c.city, c.state, c.country
 FROM geonames_cities c
 JOIN geonames_cities_fts f ON f.rowid = c.id
 WHERE geonames_cities_fts MATCH 'bombay';
+
+-- SQLite (trigram — typo-tolerant)
+SELECT c.city, c.state, c.country, COUNT(*) AS score
+FROM geonames_trigrams t
+JOIN geonames_cities c ON c.id = t.city_id
+WHERE t.trigram IN (' bo','bom','omb','mba','bay','ay ')
+GROUP BY t.city_id
+ORDER BY score DESC LIMIT 8;
+
+-- MySQL (FULLTEXT)
+SELECT c.city, c.state, c.country,
+       MATCH(c.city, c.alternate_city_names) AGAINST('bombay') AS score
+FROM geonames_cities c
+WHERE MATCH(c.city, c.alternate_city_names) AGAINST('bombay')
+ORDER BY score DESC;
 ```
 
 ---
@@ -362,9 +444,10 @@ WHERE geonames_cities_fts MATCH 'bombay';
 |---|---|---|
 | `idx_geonames_cities_city_lower` *(PG)* | `LOWER(city)` | Case-insensitive exact lookup |
 | `idx_geonames_cities_city_trgm` *(PG)* | `city` GIN trigram | `ILIKE` / `similarity()` fuzzy search |
-
 | `idx_geonames_cities_city` *(SQLite)* | `city COLLATE NOCASE` | Case-insensitive exact lookup |
+| `idx_geonames_cities_city` *(MySQL)* | `city(191)` | Case-insensitive exact lookup (via `utf8mb4_unicode_ci`) |
 | `geonames_cities_fts` *(SQLite)* | `city`, `alternate_city_names`, `state`, `region` | FTS5 full-text / prefix search |
+| `geonames_trigrams` *(SQLite)* | `(trigram, city_id)` composite PK + lookup index | Typo-tolerant fuzzy search via 3-char sliding windows |
 | `idx_geonames_cities_city_ft` *(MySQL)* | `city`, `alternate_city_names`, `state`, `region` | FULLTEXT fuzzy search |
 | `idx_geonames_cities_lat_lon` | `(latitude, longitude)` | Bounding-box proximity queries |
 | `idx_geonames_cities_country_code` | `country_code` | Filter by country |
@@ -378,9 +461,10 @@ WHERE geonames_cities_fts MATCH 'bombay';
 
 | Variable | Description | Default |
 |---|---|---|
-| `DB_DRIVER` | Backend: `postgres` or `sqlite` | — (required) |
-| `DATABASE_URL` | PostgreSQL connection URL — takes precedence over `PG*` | — |
+| `DB_DRIVER` | Backend: `postgres`, `sqlite`, or `mysql` | — (required) |
+| `DATABASE_URL` | PostgreSQL or MySQL connection URL — takes precedence over `PG*`/`MYSQL_*` | — |
 | `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSERVICE`, … | Standard libpq variables, used when `DATABASE_URL` is empty | psql defaults |
+| `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE` | Standard MySQL variables, used when `DATABASE_URL` is empty | mysql defaults |
 | `SQLITE_DB_PATH` | Path for the SQLite `.db` file | `./locationdb.db` |
 | `POSTGRES_USER` | docker-compose user *(test mode)* | `locationdb_user` |
 | `POSTGRES_PASSWORD` | docker-compose password *(test mode)* | `changeme` |
@@ -407,7 +491,12 @@ drivers/
   sqlite/
     driver.sh                 SQLite implementation
     sql/01_schema.sql         Tables, FTS5, indexes, triggers
-    sql/03_flatten.sql        Flatten + FTS5 rebuild, drop staging, VACUUM
+    sql/03_flatten.sql        Flatten + FTS5 rebuild, trigram index, drop staging, VACUUM
+  mysql/
+    driver.sh                 MySQL implementation
+    sql/01_schema.sql         Tables, FULLTEXT indexes, view
+    sql/02_load.sql           Bulk-load (LOAD DATA LOCAL INFILE)
+    sql/03_flatten.sql        Flatten staging → final tables, drop staging
 tests/
   test_sqlite.sh              Offline pipeline check on tiny fixtures
   test_postgres.sh            Same checks against a real Postgres (--test for docker)
@@ -428,15 +517,16 @@ no other files need to change.
 
 ---
 
-## SQLite vs PostgreSQL
+## SQLite vs PostgreSQL vs MySQL
 
-| Feature | PostgreSQL | SQLite |
-|---|---|---|
-| Server required | Yes | No |
-| `alternate_city_names` type | `text[]` array | comma-separated `TEXT` |
-| Fuzzy city search | `pg_trgm` + `ILIKE` | FTS5 virtual table |
-| Incremental sync | ✅ (`sync.sh`) | ❌ re-run `populate.sh` |
-| Timestamps | `now()` | `datetime('now')` |
+| Feature | PostgreSQL | SQLite | MySQL |
+|---|---|---|---|
+| Server required | Yes | No | Yes |
+| `alternate_city_names` type | `text[]` array | comma-separated `TEXT` | comma-separated `TEXT` |
+| Fuzzy city search | `pg_trgm` + `ILIKE` | FTS5 + trigram index | FULLTEXT |
+| Incremental sync | ✅ (`sync.sh`) | ❌ re-run `populate.sh` | ✅ (`sync.sh`) |
+| Timestamps | `now()` | `datetime('now')` | `CURRENT_TIMESTAMP` |
+| Pre-built download | — | ✅ (xz compressed, daily) | — |
 
 ---
 
