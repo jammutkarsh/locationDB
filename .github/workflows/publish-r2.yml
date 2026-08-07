@@ -70,6 +70,5 @@ jobs:
           AWS_DEFAULT_REGION: auto
           AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
-          aws s3 cp location.db    s3://locationdb/location.db
           aws s3 cp location.db.xz s3://locationdb/location.db.xz
           aws s3 cp location.json  s3://locationdb/location.json
