@@ -1,6 +1,8 @@
 name: Build and Publish SQLite DB
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
   schedule:
@@ -72,3 +74,16 @@ jobs:
         run: |
           aws s3 cp location.db.xz s3://locationdb/location.db.xz
           aws s3 cp location.json  s3://locationdb/location.json
+
+      - name: Purge Cloudflare cache
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+        run: |
+          curl -sf -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data '{"files":[
+              "https://locationdb.utkarshchourasia.in/location.db.xz",
+              "https://locationdb.utkarshchourasia.in/location.json"
+            ]}'
