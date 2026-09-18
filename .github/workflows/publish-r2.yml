@@ -4,9 +4,20 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      fresh:
+        description: "Build from scratch instead of upserting into the published DB"
+        type: boolean
+        default: false
 
+  # GeoNames regenerates its dump files daily.
   schedule:
-    - cron: "0 0 1 * *"
+    - cron: "0 3 * * *"
+
+# Each run upserts into the previous run's output; never let two overlap.
+concurrency:
+  group: publish-r2
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -26,6 +37,21 @@ jobs:
           unzip -q awscliv2.zip
           sudo ./aws/install --update
           rm -rf aws awscliv2.zip
+
+      # Upsert into what's published so ids and rows from earlier builds are
+      # kept. Fail rather than silently fall back to a fresh build: that would
+      # drop every city GeoNames no longer lists. Use the `fresh` input to
+      # bootstrap on purpose.
+      - name: Fetch published database
+        if: ${{ !inputs.fresh }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          aws s3 cp s3://locationdb/location.db.zst location.db.zst
+          zstd -d -f location.db.zst -o location.db
 
       - name: Build database
         run: |

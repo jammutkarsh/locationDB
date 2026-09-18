@@ -222,7 +222,7 @@ Straight off `geonames_cities` (no joins, so it uses that table's indexes):
 
 | Column | Notes |
 |---|---|
-| `id` | Primary key of `geonames_cities` (also the FTS5 rowid) |
+| `id` | Primary key of `geonames_cities` (also the FTS5 rowid). On SQLite it is the GeoNames `geonameid`, stable across builds |
 | `city` | City name |
 | `region` | District / county (admin2). Equals `state` when GeoNames has no admin2 |
 | `state` | State / province name (admin1) |
@@ -258,7 +258,7 @@ Loaded straight from `countryInfo.txt`: `country_code` (PK), `iso3`,
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | integer | Auto-generated primary key |
+| `id` | integer | Primary key. SQLite: the GeoNames `geonameid` (stable across builds, safe to store). Postgres/MySQL: auto-generated |
 | `city` | text | City name (English) |
 | `region` | text | District / county (admin2) — `Mumbai Suburban`. Equals `state` when GeoNames has no admin2 for the city |
 | `state` | text | State / province name, resolved from admin1 (`Maharashtra`) |
@@ -524,9 +524,9 @@ no other files need to change.
 | Server required | Yes | No | Yes |
 | `alternate_city_names` type | `text[]` array | comma-separated `TEXT` | comma-separated `TEXT` |
 | Fuzzy city search | `pg_trgm` + `ILIKE` | FTS5 + trigram index | FULLTEXT |
-| Incremental sync | ✅ (`sync.sh`) | ❌ re-run `populate.sh` | ✅ (`sync.sh`) |
+| Incremental sync | ✅ (`sync.sh`) | re-run `populate.sh` on the same `--db-path`: upserts, never deletes | ✅ (`sync.sh`) |
 | Timestamps | `now()` | `datetime('now')` | `CURRENT_TIMESTAMP` |
-| Pre-built download | — | ✅ (xz compressed, daily) | — |
+| Pre-built download | — | ✅ (zstd compressed, daily) | — |
 
 ---
 

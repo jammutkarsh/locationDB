@@ -1,23 +1,23 @@
 -- SQLite schema for locationDB
 -- Key differences from Postgres:
 --   • No ARRAY type — alternate_city_names stored as comma-separated TEXT
---   • INTEGER PRIMARY KEY AUTOINCREMENT instead of BIGSERIAL
+--   • geonames_cities.id IS the GeoNames geonameid — stable across builds
 --   • datetime('now') instead of now()
 --   • No CASCADE on DROP (SQLite ignores it anyway)
 
+--   • Idempotent: final tables are CREATE IF NOT EXISTS and 03_flatten.sql
+--     upserts into them, so running the pipeline over an existing .db keeps
+--     every row (and its id) and only adds/updates. Only staging is dropped.
+
+-- Schema version. driver.sh discards a .db whose user_version differs
+-- v2: ids = geonameid (older builds had unstable AUTOINCREMENT ids).
+-- v3: geonames_trigrams is WITHOUT ROWID.
+PRAGMA user_version = 3;
+
 DROP VIEW IF EXISTS locations;
-DROP TRIGGER IF EXISTS geonames_cities_ai;
-DROP TRIGGER IF EXISTS geonames_cities_ad;
-DROP TRIGGER IF EXISTS geonames_cities_au;
-DROP TABLE IF EXISTS geonames_cities_fts;
-DROP TABLE IF EXISTS geonames_trigrams;
 DROP TABLE IF EXISTS cities1000;
 DROP TABLE IF EXISTS admin1Codes;
 DROP TABLE IF EXISTS admin2Codes;
-DROP TABLE IF EXISTS sync_state;
-DROP TABLE IF EXISTS geonames_cities;
-DROP TABLE IF EXISTS geonames_states;
-DROP TABLE IF EXISTS geonames_countries;
 
 -- Raw GeoNames staging tables — dropped again at the end of 03_flatten.sql,
 -- they only exist while the import runs.
@@ -58,7 +58,7 @@ CREATE TABLE admin2Codes (
 );
 
 -- Incremental-sync state tracker
-CREATE TABLE sync_state (
+CREATE TABLE IF NOT EXISTS sync_state (
     name        TEXT PRIMARY KEY,
     last_synced TEXT NOT NULL   -- ISO-8601 date string
 );
@@ -73,8 +73,8 @@ CREATE INDEX IF NOT EXISTS idx_cities_cc     ON cities1000 (country_code);
 
 -- Final flattened output table
 -- alternate_city_names: comma-separated TEXT (SQLite has no array type)
-CREATE TABLE geonames_cities (
-    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+CREATE TABLE IF NOT EXISTS geonames_cities (
+    id                   INTEGER PRIMARY KEY,  -- = geonameid; never reassigned
     city                 TEXT,
     region               TEXT,   -- admin2 name if present, else the state
     state                TEXT,   -- resolved admin1 name, e.g. 'Maharashtra'
@@ -95,7 +95,7 @@ CREATE TABLE geonames_cities (
 -- Countries — loaded directly from GeoNames countryInfo.txt (19 columns,
 -- in file order: .import maps them positionally, so do not reorder).
 -- -------------------------------------------------------------------------
-CREATE TABLE geonames_countries (
+CREATE TABLE IF NOT EXISTS geonames_countries (
     country_code       TEXT PRIMARY KEY,   -- ISO-3166 alpha-2
     iso3               TEXT,
     iso_numeric        TEXT,
@@ -117,11 +117,15 @@ CREATE TABLE geonames_countries (
     equivalent_fips    TEXT
 );
 
+-- Countries are .import-ed straight into this table (no staging), so clear
+-- it first; country_code is the key and is stable, so nothing is lost.
+DELETE FROM geonames_countries;
+
 -- -------------------------------------------------------------------------
 -- States / provinces — GeoNames first-level admin divisions (admin1).
 -- Filled from the admin1Codes staging table in 03_flatten.sql.
 -- -------------------------------------------------------------------------
-CREATE TABLE geonames_states (
+CREATE TABLE IF NOT EXISTS geonames_states (
     code         TEXT PRIMARY KEY,   -- 'IN.16'  (country_code . admin1_code)
     country_code TEXT,
     admin1_code  TEXT,
@@ -153,7 +157,7 @@ CREATE INDEX IF NOT EXISTS idx_geonames_cities_city
 --   Phrase:     WHERE geonames_cities_fts MATCH '"new york"'
 --   Any column: WHERE geonames_cities_fts MATCH 'mumbai OR bombay'
 -- -------------------------------------------------------------------------
-CREATE VIRTUAL TABLE geonames_cities_fts USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS geonames_cities_fts USING fts5(
     city,
     alternate_city_names,
     state,
@@ -164,17 +168,17 @@ CREATE VIRTUAL TABLE geonames_cities_fts USING fts5(
 
 -- Triggers keep the FTS5 index in sync with geonames_cities for
 -- incremental updates (inserts, deletes, edits after the initial load).
-CREATE TRIGGER geonames_cities_ai AFTER INSERT ON geonames_cities BEGIN
+CREATE TRIGGER IF NOT EXISTS geonames_cities_ai AFTER INSERT ON geonames_cities BEGIN
     INSERT INTO geonames_cities_fts(rowid, city, alternate_city_names, state, region)
     VALUES (new.id, new.city, new.alternate_city_names, new.state, new.region);
 END;
 
-CREATE TRIGGER geonames_cities_ad AFTER DELETE ON geonames_cities BEGIN
+CREATE TRIGGER IF NOT EXISTS geonames_cities_ad AFTER DELETE ON geonames_cities BEGIN
     INSERT INTO geonames_cities_fts(geonames_cities_fts, rowid, city, alternate_city_names, state, region)
     VALUES ('delete', old.id, old.city, old.alternate_city_names, old.state, old.region);
 END;
 
-CREATE TRIGGER geonames_cities_au AFTER UPDATE ON geonames_cities BEGIN
+CREATE TRIGGER IF NOT EXISTS geonames_cities_au AFTER UPDATE ON geonames_cities BEGIN
     INSERT INTO geonames_cities_fts(geonames_cities_fts, rowid, city, alternate_city_names, state, region)
     VALUES ('delete', old.id, old.city, old.alternate_city_names, old.state, old.region);
     INSERT INTO geonames_cities_fts(rowid, city, alternate_city_names, state, region)
@@ -195,14 +199,16 @@ END;
 --   GROUP BY gt.city_id
 --   ORDER BY score DESC LIMIT 8
 --
--- A primary key (trigram, city_id) auto-indexes the join column city_id.
+-- WITHOUT ROWID: the table is stored once, as a B-tree ordered by its primary
+-- key, instead of a rowid table plus a separate index copying both columns.
+-- Lookups by trigram use that key directly (trigram is its leading column),
+-- so no extra index is needed. Cut the published .db from 414 MB to 177 MB.
 -- ---------------------------------------------------------------------------
-CREATE TABLE geonames_trigrams (
+CREATE TABLE IF NOT EXISTS geonames_trigrams (
     trigram  TEXT    NOT NULL,
     city_id  INTEGER NOT NULL,
     PRIMARY KEY (trigram, city_id)
-);
-CREATE INDEX idx_trigram_lookup ON geonames_trigrams(trigram);
+) WITHOUT ROWID;
 
 -- ---------------------------------------------------------------------------
 -- Query 2: Proximity / reverse-geocoding by lat & long

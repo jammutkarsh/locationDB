@@ -33,6 +33,12 @@ db_check_deps() {
 db_init() {
   log_step "Creating schema..."
   mkdir -p "$(dirname "$SQLITE_PATH")"
+  # An existing .db is upserted into, keeping its ids. One built by an older
+  # schema (see user_version in 01_schema.sql) can't be, so start it over.
+  if [[ -f "$SQLITE_PATH" && "$(sqlite3 "$SQLITE_PATH" 'PRAGMA user_version;')" != 3 ]]; then
+    log_warn "$SQLITE_PATH has an older schema — rebuilding from scratch."
+    rm -f "$SQLITE_PATH"
+  fi
   sqlite3 "$SQLITE_PATH" < "$DRIVER_DIR/sql/01_schema.sql"
 }
 

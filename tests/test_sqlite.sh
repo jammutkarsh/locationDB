@@ -123,8 +123,10 @@ assert_eq "$(q "SELECT s.state FROM geonames_cities c
 # Trigram index for typo-tolerant search
 assert_eq "$(q "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='geonames_trigrams';")" \
           "1" "geonames_trigrams table exists"
-assert_eq "$(q "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_trigram_lookup';")" \
-          "1" "trigram index exists"
+assert_eq "$(q "SELECT sql LIKE '%WITHOUT ROWID' FROM sqlite_master WHERE name='geonames_trigrams';")" \
+          "1" "geonames_trigrams is WITHOUT ROWID"
+assert_eq "$(q "EXPLAIN QUERY PLAN SELECT city_id FROM geonames_trigrams WHERE trigram IN ('mum','bom');" | grep -c 'USING PRIMARY KEY')" \
+          "1" "trigram lookups use the primary key"
 
 TRIGRAM_COUNT=$(q 'SELECT COUNT(*) FROM geonames_trigrams;')
 if [[ "$TRIGRAM_COUNT" -lt 15 ]]; then
@@ -132,14 +134,56 @@ if [[ "$TRIGRAM_COUNT" -lt 15 ]]; then
   exit 1
 fi
 # Spot-check known trigrams
-assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=1 AND trigram='mum';")" \
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=1275339 AND trigram='mum';")" \
           "1" "trigram 'mum' for Mumbai"
-assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=1 AND trigram='bom';")" \
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=1275339 AND trigram='bom';")" \
           "1" "trigram 'bom' for Mumbai (from alt Bombay)"
-assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=2 AND trigram='new';")" \
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=5128581 AND trigram='new';")" \
           "1" "trigram 'new' for New York City"
-assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=2 AND trigram='nyc';")" \
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=5128581 AND trigram='nyc';")" \
           "1" "trigram 'nyc' for New York City (from alt NYC)"
+
+# ids are geonameids, so they survive every rebuild.
+assert_eq "$(q "SELECT id FROM geonames_cities WHERE city = 'Mumbai';")" \
+          "1275339" "id = geonameid"
+
+# Second run over the same .db = next day's upsert: Mumbai renamed + population
+# changed, New York City gone from the dump, Pune new.
+printf '%s\n' \
+  $'1275339\tMumbai City\tMumbai City\tBombay\t19.07283\t72.88261\tP\tPPLA\tIN\t\t16\t517\t\t\t13000000\t\t8\tAsia/Kolkata\t2026-09-18' \
+  $'1259229\tPune\tPune\tPoona\t18.51957\t73.85535\tP\tPPLA2\tIN\t\t16\t\t\t\t3124458\t\t560\tAsia/Kolkata\t2026-09-18' \
+  > data/cities1000.txt
+db_init; db_load; db_flatten
+SNAPSHOT=$(q "SELECT id, city, population, updated_at FROM geonames_cities ORDER BY id;
+              SELECT * FROM geonames_trigrams ORDER BY 1, 2;")
+
+assert_eq "$(q 'SELECT COUNT(*) FROM geonames_cities;')" "3" "upsert adds, never deletes"
+assert_eq "$(q "SELECT city || '|' || population FROM geonames_cities WHERE id = 1275339;")" \
+          "Mumbai City|13000000" "existing id updated in place"
+assert_eq "$(q "SELECT city FROM geonames_cities WHERE id = 5128581;")" \
+          "New York City" "city missing from dump is kept"
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_countries;")" "2" "countries re-imported, not duplicated"
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=1275339 AND trigram='cit';")" \
+          "1" "renamed city gets new trigrams"
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=1275339 AND trigram='umb';")" \
+          "1" "renamed city still matches its current name"
+assert_eq "$(q "SELECT COUNT(*) FROM geonames_trigrams WHERE city_id=5128581 AND trigram='nyc';")" \
+          "1" "kept city keeps its trigrams"
+assert_eq "$(q "SELECT l.city FROM locations l
+                JOIN geonames_cities_fts f ON f.rowid = l.id
+                WHERE geonames_cities_fts MATCH 'poona';")" \
+          "Pune" "FTS5 indexes upserted rows"
+
+# Same input again: nothing changes, not even updated_at.
+printf '%s\n' \
+  $'1275339\tMumbai City\tMumbai City\tBombay\t19.07283\t72.88261\tP\tPPLA\tIN\t\t16\t517\t\t\t13000000\t\t8\tAsia/Kolkata\t2026-09-18' \
+  $'1259229\tPune\tPune\tPoona\t18.51957\t73.85535\tP\tPPLA2\tIN\t\t16\t\t\t\t3124458\t\t560\tAsia/Kolkata\t2026-09-18' \
+  > data/cities1000.txt
+sleep 1
+db_init; db_load; db_flatten
+assert_eq "$(q "SELECT id, city, population, updated_at FROM geonames_cities ORDER BY id;
+                SELECT * FROM geonames_trigrams ORDER BY 1, 2;")" \
+          "$SNAPSHOT" "re-run on same input is a no-op"
 
 # --cache: cleanup must be skippable so downloaded Geonames files survive.
 # Simulate a fresh data/ dir (the real cleanup deleted the one from db_load).

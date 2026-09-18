@@ -9,17 +9,28 @@ DROP TRIGGER IF EXISTS geonames_cities_ad;
 DROP TRIGGER IF EXISTS geonames_cities_au;
 
 -- States / provinces (admin1). code looks like 'IN.16'.
-INSERT OR IGNORE INTO geonames_states (code, country_code, admin1_code, state, ascii_state, geonameid)
+INSERT INTO geonames_states (code, country_code, admin1_code, state, ascii_state, geonameid)
 SELECT code, substr(code, 1, instr(code, '.') - 1), substr(code, instr(code, '.') + 1),
        name, asciiname, geonameid
 FROM admin1Codes
-WHERE instr(code, '.') > 0;
+WHERE instr(code, '.') > 0
+ON CONFLICT (code) DO UPDATE SET
+    state       = excluded.state,
+    ascii_state = excluded.ascii_state,
+    geonameid   = excluded.geonameid;
 
 -- How the pieces line up:
 --   country_code                  -> countryInfo.ISO      -> country name
 --   country_code.admin1_code      -> admin1Codes.code     -> state name
 --   country_code.admin1.admin2    -> admin2Codes.code     -> district name
-INSERT OR IGNORE INTO geonames_cities (
+--
+-- Upsert keyed on id = geonameid: a city already in the .db keeps its id and
+-- gets today's values; a new one is added. Cities missing from today's dump
+-- (deleted/merged upstream, or population fell under 1000) are deliberately
+-- kept, so an id a client stored never stops resolving. updated_at only moves
+-- when a value actually changed, so re-running on the same input is a no-op.
+INSERT INTO geonames_cities (
+    id,
     city,
     region,
     state,
@@ -34,6 +45,7 @@ INSERT OR IGNORE INTO geonames_cities (
     geonameid
 )
 SELECT
+    c.geonameid,
     c.name,
     COALESCE(a2.name, a1.name, c.admin1_code) AS region,
     COALESCE(a1.name, c.admin1_code) AS state,
@@ -49,7 +61,29 @@ SELECT
 FROM cities1000 c
 LEFT JOIN admin1Codes a1 ON a1.code = c.country_code || '.' || c.admin1_code
 LEFT JOIN admin2Codes a2 ON a2.code = c.country_code || '.' || c.admin1_code || '.' || c.admin2_code
-LEFT JOIN geonames_countries o ON o.country_code = c.country_code;
+LEFT JOIN geonames_countries o ON o.country_code = c.country_code
+WHERE true  -- required: disambiguates the JOIN ... ON from the upsert's ON CONFLICT
+ON CONFLICT (id) DO UPDATE SET
+    city                 = excluded.city,
+    region               = excluded.region,
+    state                = excluded.state,
+    country              = excluded.country,
+    latitude             = excluded.latitude,
+    longitude            = excluded.longitude,
+    population           = excluded.population,
+    alternate_city_names = excluded.alternate_city_names,
+    timezone             = excluded.timezone,
+    country_code         = excluded.country_code,
+    state_code           = excluded.state_code,
+    geonameid            = excluded.geonameid,
+    updated_at           = datetime('now')
+WHERE (city, region, state, country, latitude, longitude, population,
+       alternate_city_names, timezone, country_code, state_code)
+      IS NOT
+      (excluded.city, excluded.region, excluded.state, excluded.country,
+       excluded.latitude, excluded.longitude, excluded.population,
+       excluded.alternate_city_names, excluded.timezone, excluded.country_code,
+       excluded.state_code);
 
 -- Build the FTS5 index in a single pass from the content table.
 -- Much faster than per-row trigger inserts for the initial load.
@@ -79,7 +113,13 @@ END;
 --
 -- We join back to the cities1000 staging table (still present) to grab
 -- asciiname (diacritic-free) and alternatenames (comma-separated).
+--
+-- Only cities in today's dump are (re)indexed: their old trigrams are cleared
+-- first so a renamed city stops matching its old name. Cities kept from an
+-- earlier build keep the trigrams they already had.
 -- ---------------------------------------------------------------------------
+DELETE FROM geonames_trigrams WHERE city_id IN (SELECT geonameid FROM cities1000);
+
 INSERT OR IGNORE INTO geonames_trigrams (trigram, city_id)
 WITH RECURSIVE
   pos(n) AS (
@@ -100,16 +140,18 @@ WITH RECURSIVE
     FROM alt_split WHERE rest != ''
   ),
   names(city_id, name) AS (
-    SELECT id, lower(city) FROM geonames_cities
+    SELECT gc.id, lower(gc.city)
+    FROM geonames_cities gc
+    JOIN cities1000 c ON c.geonameid = gc.id
     UNION
     SELECT gc.id, lower(c.asciiname)
     FROM geonames_cities gc
-    JOIN cities1000 c ON c.geonameid = gc.geonameid
+    JOIN cities1000 c ON c.geonameid = gc.id
     WHERE lower(c.asciiname) != lower(gc.city)
     UNION
     SELECT gc.id, lower(s.name)
     FROM alt_split s
-    JOIN geonames_cities gc ON gc.geonameid = s.geonameid
+    JOIN geonames_cities gc ON gc.id = s.geonameid
     WHERE s.name != ''
   )
 SELECT substr('  ' || name || '  ', pos.n, 3), city_id
