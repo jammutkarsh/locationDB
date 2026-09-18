@@ -39,9 +39,9 @@ jobs:
           rm -rf aws awscliv2.zip
 
       # Upsert into what's published so ids and rows from earlier builds are
-      # kept. Fail rather than silently fall back to a fresh build: that would
-      # drop every city GeoNames no longer lists. Use the `fresh` input to
-      # bootstrap on purpose.
+      # kept. If it can't be fetched, fall through to a fresh build: ids stay
+      # the same (they are geonameids), only cities GeoNames no longer lists
+      # are lost. The `fresh` input forces that on purpose.
       - name: Fetch published database
         if: ${{ !inputs.fresh }}
         env:
@@ -50,8 +50,13 @@ jobs:
           AWS_DEFAULT_REGION: auto
           AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
-          aws s3 cp s3://locationdb/location.db.zst location.db.zst
-          zstd -d -f location.db.zst -o location.db
+          if aws s3 cp s3://locationdb/location.db.zst location.db.zst \
+             && zstd -d -f location.db.zst -o location.db; then
+            echo "Upserting into the published database."
+          else
+            echo "::warning::Could not fetch the published database; building from scratch."
+            rm -f location.db location.db.zst
+          fi
 
       - name: Build database
         run: |
@@ -106,7 +111,7 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
         run: |
-          curl -sf -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+          curl -sS --fail-with-body -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
             --data '{"files":[
